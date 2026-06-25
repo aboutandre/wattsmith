@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Wattsmith",
+        "description": "Set up the Wattsmith energy brain. Site configuration (sensors, batteries, and control thresholds) is added in a later step."
+      }
+    },
+    "abort": {
+      "already_configured": "Wattsmith is already configured."
+    }
+  }
+}
