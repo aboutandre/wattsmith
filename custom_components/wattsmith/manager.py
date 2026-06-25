@@ -75,7 +75,10 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         # grid sensor: option override (repointable via options flow) else original data value
         self.grid_sensor: str = entry.options.get(CONF_GRID_SENSOR) or entry.data[CONF_GRID_SENSOR]
         self.ev_sensor: str | None = entry.options.get(CONF_EV_SENSOR) or None
-        self.enabled: bool = entry.options.get("enabled", True)
+        # Default OFF on a fresh install: the user enables Zero-Grid Control
+        # explicitly once configured (and after disabling any other brain). Once
+        # toggled, the choice persists in options.
+        self.enabled: bool = entry.options.get("enabled", False)
         self.min_soc: float = float(entry.options.get(CONF_MIN_SOC, DEFAULT_MIN_SOC))
         self.max_battery_soc: float = float(entry.options.get(CONF_MAX_BATTERY_SOC, DEFAULT_MAX_BATTERY_SOC))
 
@@ -124,7 +127,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         self.max_battery_soc = float(self._opt(CONF_MAX_BATTERY_SOC, DEFAULT_MAX_BATTERY_SOC))
         self.grid_sensor = self.entry.options.get(CONF_GRID_SENSOR) or self.entry.data[CONF_GRID_SENSOR]
         self.ev_sensor = self.entry.options.get(CONF_EV_SENSOR) or None
-        self.enabled = self.entry.options.get("enabled", True)
+        self.enabled = self.entry.options.get("enabled", False)
         self.controller.config = self._build_controller_config()
         self.planner.config = self._build_planner_config()
 
