@@ -3,11 +3,29 @@
     "step": {
       "user": {
         "title": "Wattsmith",
-        "description": "Set up the Wattsmith energy brain. Site configuration (sensors, batteries, and control thresholds) is added in a later step."
+        "description": "{info}",
+        "data": {
+          "grid_sensor": "Grid power sensor"
+        }
       }
     },
     "abort": {
       "already_configured": "Wattsmith is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Wattsmith options",
+        "description": "{info}",
+        "data": {
+          "grid_sensor": "Grid power sensor",
+          "ev_sensor": "EV charger power sensor",
+          "goe_ip": "go-e charger IP",
+          "tibber_sensor": "Electricity price sensor (Tibber)",
+          "car_state_sensor": "Car state sensor"
+        }
+      }
     }
   }
 }
