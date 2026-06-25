@@ -28,6 +28,10 @@ async def async_setup_entry(
         ManagerSensor(coordinator, entry.entry_id, entry.title, d)
         for d in MANAGER_SENSORS
     ]
+    entities += [
+        AdaptiveSensor(coordinator, entry.entry_id, entry.title, d)
+        for d in ADAPTIVE_SENSORS
+    ]
     ev_coord: EvCoordinator | None = hass.data[DOMAIN].get(entry.entry_id + "_ev")
     if ev_coord is not None:
         entities.extend(
@@ -51,6 +55,13 @@ EV_SENSORS: tuple[tuple[str, str, str | None, str | None, str], ...] = (
     ("amp", "EV Charge Current", "A", "current", "mdi:current-ac"),
     ("phases", "EV Phases", None, None, "mdi:numeric"),
     ("target_power_w", "EV Target Power", "W", "power", "mdi:lightning-bolt"),
+)
+
+# Adaptive PV charging sub-keys (read from coordinator.data["adaptive"]).
+ADAPTIVE_SENSORS: tuple[tuple[str, str, str | None, str | None, str], ...] = (
+    ("status", "Adaptive Status", None, None, "mdi:auto-fix"),
+    ("effective_max_soc", "Adaptive Effective Max SOC", "%", "battery", "mdi:battery-charging-100"),
+    ("fleet_headroom_wh", "Adaptive Fleet Headroom", "Wh", "energy", "mdi:battery-plus-variant"),
 )
 
 
@@ -86,6 +97,33 @@ class ManagerSensor(CoordinatorEntity, SensorEntity):
             return None
         data = self.coordinator.data or {}
         return {"setpoints": data.get("setpoints"), "safety": data.get("safety")}
+
+
+class AdaptiveSensor(CoordinatorEntity, SensorEntity):
+    """A status sensor of adaptive PV charging (reads coordinator.data['adaptive'])."""
+
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator, entry_id, title, desc) -> None:
+        super().__init__(coordinator)
+        key, name, unit, device_class, icon = desc
+        self._key = key
+        self._attr_name = name
+        self._attr_native_unit_of_measurement = unit
+        self._attr_device_class = device_class
+        self._attr_icon = icon
+        self._attr_unique_id = f"{entry_id}_adaptive_{key}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry_id)},
+            "name": title,
+            "manufacturer": "Wattsmith",
+            "model": "Energy Brain",
+        }
+
+    @property
+    def native_value(self) -> Any:
+        adaptive = (self.coordinator.data or {}).get("adaptive") or {}
+        return adaptive.get(self._key)
 
 
 class EvSensor(CoordinatorEntity, SensorEntity):

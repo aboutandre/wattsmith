@@ -10,7 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .const import CONF_ADAPTIVE_ENABLED, DOMAIN
 from .manager import EnergyManagerCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -21,9 +21,12 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the Energy Manager enable switch."""
+    """Set up the Energy Manager switches."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([WattsmithEnableSwitch(coordinator, entry)])
+    async_add_entities([
+        WattsmithEnableSwitch(coordinator, entry),
+        AdaptiveEnableSwitch(coordinator, entry),
+    ])
 
 
 class WattsmithEnableSwitch(CoordinatorEntity, SwitchEntity):
@@ -60,3 +63,39 @@ class WattsmithEnableSwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         await self._set_enabled(False)
+
+
+class AdaptiveEnableSwitch(CoordinatorEntity, SwitchEntity):
+    """Enable/disable adaptive PV charging (push past the cap toward the ceiling)."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:weather-sunny"
+
+    def __init__(self, coordinator: EnergyManagerCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_adaptive_pv_charging"
+        self._attr_name = "Adaptive Charging"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": entry.title,
+            "manufacturer": "Wattsmith",
+            "model": "Energy Brain",
+        }
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self.coordinator.adaptive_enabled)
+
+    async def _set(self, value: bool) -> None:
+        self.coordinator.adaptive_enabled = value
+        new_options = {**self.coordinator.entry.options, CONF_ADAPTIVE_ENABLED: value}
+        self.hass.config_entries.async_update_entry(
+            self.coordinator.entry, options=new_options
+        )
+        await self.coordinator.async_request_refresh()
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self._set(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._set(False)

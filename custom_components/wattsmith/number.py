@@ -17,6 +17,9 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    CONF_ADAPTIVE_BASELINE_W,
+    CONF_ADAPTIVE_CEILING_SOC,
+    CONF_ADAPTIVE_FORECAST_DERATE,
     CONF_BRIDGE_FLOOR_SOC,
     CONF_BRIDGE_GRACE_S,
     CONF_CHEAP_PRICE_THRESHOLD,
@@ -104,6 +107,12 @@ NUMBERS: tuple[ManagerNumber, ...] = (
                   "mdi:battery-low", lambda c: c.min_soc),
     ManagerNumber(CONF_MAX_BATTERY_SOC, "Maximum Charge SOC", 50, 100, 1, "%",
                   "mdi:battery-high", lambda c: c.max_battery_soc),
+    ManagerNumber(CONF_ADAPTIVE_CEILING_SOC, "Adaptive Ceiling SOC", 50, 100, 1, "%",
+                  "mdi:battery-charging-100", lambda c: c.adaptive_ceiling_soc),
+    ManagerNumber(CONF_ADAPTIVE_BASELINE_W, "Adaptive Baseline Load", 0, 3000, 50, "W",
+                  "mdi:home-lightning-bolt", lambda c: c.adaptive_baseline_w),
+    ManagerNumber(CONF_ADAPTIVE_FORECAST_DERATE, "Adaptive Forecast Derate", 0.5, 1.0, 0.05, None,
+                  "mdi:cloud-percent", lambda c: c.adaptive_forecast_derate),
 )
 
 

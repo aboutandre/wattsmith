@@ -23,7 +23,8 @@
           "ev_sensor": "EV charger power sensor",
           "goe_ip": "go-e charger IP",
           "tibber_sensor": "Electricity price sensor (Tibber)",
-          "car_state_sensor": "Car state sensor"
+          "car_state_sensor": "Car state sensor",
+          "solcast_remaining_sensor": "Solcast remaining-today sensor (adaptive PV charging)"
         }
       }
     }

@@ -55,6 +55,22 @@ MANAGER_DEGRADED_THRESHOLD: Final = 3  # consecutive missed acks before flagging
 MANAGER_RESEND_S: Final = 7.0          # re-arm setpoints only if last send older than this (< cd_time)
 
 # ---------------------------------------------------------------------------
+# Adaptive PV charging (dynamically raise the effective Max SOC toward a ceiling,
+# timed to crest near sunset — see adaptive.py)
+# ---------------------------------------------------------------------------
+CONF_ADAPTIVE_ENABLED: Final = "adaptive_enabled"
+CONF_ADAPTIVE_CEILING_SOC: Final = "adaptive_ceiling_soc"
+CONF_ADAPTIVE_BASELINE_W: Final = "adaptive_baseline_w"
+CONF_ADAPTIVE_FORECAST_DERATE: Final = "adaptive_forecast_derate"
+CONF_SOLCAST_REMAINING_SENSOR: Final = "solcast_remaining_sensor"  # HA entity_id, remaining PV today
+CONF_SUN_SENSOR: Final = "sun_sensor"                             # HA entity_id, default sun.sun
+
+DEFAULT_ADAPTIVE_CEILING_SOC: Final = 100.0
+DEFAULT_ADAPTIVE_BASELINE_W: Final = 500.0
+DEFAULT_ADAPTIVE_FORECAST_DERATE: Final = 0.9
+DEFAULT_SUN_SENSOR: Final = "sun.sun"
+
+# ---------------------------------------------------------------------------
 # EV Coordinator (go-e local-API control)
 # ---------------------------------------------------------------------------
 CONF_GOE_IP: Final = "goe_ip"

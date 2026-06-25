@@ -1,13 +1,17 @@
 {
   "domain": "wattsmith",
   "name": "Wattsmith",
-  "version": "0.1.0",
-  "codeowners": ["@aboutandre"],
+  "version": "0.2.0",
+  "codeowners": [
+    "@aboutandre"
+  ],
   "config_flow": true,
   "documentation": "https://github.com/aboutandre/wattsmith",
   "issue_tracker": "https://github.com/aboutandre/wattsmith/issues",
   "requirements": [],
-  "after_dependencies": ["hacs_marstek_venus_e"],
+  "after_dependencies": [
+    "hacs_marstek_venus_e"
+  ],
   "homeassistant": "2025.11.0",
   "iot_class": "calculated",
   "integration_type": "hub"

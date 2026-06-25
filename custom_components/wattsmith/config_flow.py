@@ -15,6 +15,7 @@ from .const import (
     CONF_EV_SENSOR,
     CONF_GOE_IP,
     CONF_GRID_SENSOR,
+    CONF_SOLCAST_REMAINING_SENSOR,
     CONF_TIBBER_SENSOR,
     DOMAIN,
 )
@@ -85,7 +86,8 @@ class WattsmithOptionsFlow(config_entries.OptionsFlow):
             grid = user_input.get(CONF_GRID_SENSOR)
             if grid:
                 new_options[CONF_GRID_SENSOR] = grid
-            for key in (CONF_EV_SENSOR, CONF_TIBBER_SENSOR, CONF_CAR_STATE_SENSOR):
+            for key in (CONF_EV_SENSOR, CONF_TIBBER_SENSOR, CONF_CAR_STATE_SENSOR,
+                        CONF_SOLCAST_REMAINING_SENSOR):
                 value = user_input.get(key)
                 if value:
                     new_options[key] = value
@@ -105,6 +107,7 @@ class WattsmithOptionsFlow(config_entries.OptionsFlow):
         current_goe = opts.get(CONF_GOE_IP, "")
         current_tibber = opts.get(CONF_TIBBER_SENSOR, "")
         current_car = opts.get(CONF_CAR_STATE_SENSOR, "")
+        current_solcast = opts.get(CONF_SOLCAST_REMAINING_SENSOR, "")
 
         def _suggest(value: str) -> dict[str, str]:
             return {"suggested_value": value} if value else {}
@@ -127,6 +130,8 @@ class WattsmithOptionsFlow(config_entries.OptionsFlow):
                     selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor")),
                 vol.Optional(CONF_CAR_STATE_SENSOR, description=_suggest(current_car)):
                     selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor")),
+                vol.Optional(CONF_SOLCAST_REMAINING_SENSOR, description=_suggest(current_solcast)):
+                    selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor")),
             }
         )
         return self.async_show_form(
@@ -137,6 +142,7 @@ class WattsmithOptionsFlow(config_entries.OptionsFlow):
                 "EV power sensor: subtracted from grid (batteries cover house, grid covers car), "
                 "except during a battery bridge (brief PV dip) when the batteries carry the car too. "
                 "go-e IP: leave blank to disable EV control. "
-                "Tibber + car-state sensors: needed for solar/cheap EV charging."
+                "Tibber + car-state sensors: needed for solar/cheap EV charging. "
+                "Solcast remaining-today sensor: enables adaptive PV charging."
             },
         )

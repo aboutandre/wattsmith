@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -23,8 +23,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
+from .adaptive import AdaptiveConfig, AdaptiveObservation, AdaptiveResult, plan_adaptive_ceiling
 from .battery_bridge import BatteryBridge
 from .const import (
+    CONF_ADAPTIVE_BASELINE_W,
+    CONF_ADAPTIVE_CEILING_SOC,
+    CONF_ADAPTIVE_ENABLED,
+    CONF_ADAPTIVE_FORECAST_DERATE,
     CONF_DEADBAND_W,
     CONF_DIRECTION_HYSTERESIS_W,
     CONF_EV_SENSOR,
@@ -34,7 +39,12 @@ from .const import (
     CONF_MAX_BATTERY_SOC,
     CONF_MAX_STEP_W,
     CONF_MIN_SOC,
+    CONF_SOLCAST_REMAINING_SENSOR,
+    CONF_SUN_SENSOR,
     CONF_TARGET_GRID_W,
+    DEFAULT_ADAPTIVE_BASELINE_W,
+    DEFAULT_ADAPTIVE_CEILING_SOC,
+    DEFAULT_ADAPTIVE_FORECAST_DERATE,
     DEFAULT_DEADBAND_W,
     DEFAULT_DIRECTION_HYSTERESIS_W,
     DEFAULT_KD,
@@ -43,6 +53,7 @@ from .const import (
     DEFAULT_MAX_BATTERY_SOC,
     DEFAULT_MAX_STEP_W,
     DEFAULT_MIN_SOC,
+    DEFAULT_SUN_SENSOR,
     DEFAULT_TARGET_GRID_W,
     DOMAIN,
     MANAGER_BATTERY_FAIL_THRESHOLD,
@@ -81,6 +92,9 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         self.enabled: bool = entry.options.get("enabled", False)
         self.min_soc: float = float(entry.options.get(CONF_MIN_SOC, DEFAULT_MIN_SOC))
         self.max_battery_soc: float = float(entry.options.get(CONF_MAX_BATTERY_SOC, DEFAULT_MAX_BATTERY_SOC))
+        self._read_adaptive_options()
+        # Latest adaptive decision (published for the Adaptive entities).
+        self._adaptive: AdaptiveResult | None = None
 
         self.controller = ZeroGridController(self._build_controller_config())
         self.supervisor = SafetySupervisor(
@@ -97,6 +111,14 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
     # ---- configuration --------------------------------------------------
     def _opt(self, key: str, default: Any) -> Any:
         return self.entry.options.get(key, self.entry.data.get(key, default))
+
+    def _read_adaptive_options(self) -> None:
+        self.adaptive_enabled: bool = bool(self._opt(CONF_ADAPTIVE_ENABLED, False))
+        self.adaptive_ceiling_soc: float = float(self._opt(CONF_ADAPTIVE_CEILING_SOC, DEFAULT_ADAPTIVE_CEILING_SOC))
+        self.adaptive_baseline_w: float = float(self._opt(CONF_ADAPTIVE_BASELINE_W, DEFAULT_ADAPTIVE_BASELINE_W))
+        self.adaptive_forecast_derate: float = float(self._opt(CONF_ADAPTIVE_FORECAST_DERATE, DEFAULT_ADAPTIVE_FORECAST_DERATE))
+        self.solcast_sensor: str | None = self._opt(CONF_SOLCAST_REMAINING_SENSOR, None) or None
+        self.sun_sensor: str = self._opt(CONF_SUN_SENSOR, DEFAULT_SUN_SENSOR) or DEFAULT_SUN_SENSOR
 
     def _build_controller_config(self) -> ControllerConfig:
         return ControllerConfig(
@@ -128,21 +150,84 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         self.grid_sensor = self.entry.options.get(CONF_GRID_SENSOR) or self.entry.data[CONF_GRID_SENSOR]
         self.ev_sensor = self.entry.options.get(CONF_EV_SENSOR) or None
         self.enabled = self.entry.options.get("enabled", False)
+        self._read_adaptive_options()
         self.controller.config = self._build_controller_config()
         self.planner.config = self._build_planner_config()
 
     # ---- HA I/O (gathering observations) -------------------------------
-    def _battery_readings(self) -> tuple[list[BatteryReading], dict[str, str]]:
+    def _battery_readings(self, states) -> tuple[list[BatteryReading], dict[str, str]]:
         """Build planner readings + a battery_id -> device_id map for dispatch."""
         readings: list[BatteryReading] = []
         device_by_id: dict[str, str] = {}
-        for st in self.bridge.read_all():
+        for st in states:
             readings.append(BatteryReading(
                 id=st.battery_id, soc=st.soc, power=st.power, read_ok=st.available,
                 min_soc=self.min_soc, max_power=DEFAULT_MAX_BATTERY_POWER,
             ))
             device_by_id[st.battery_id] = st.device_id
         return readings, device_by_id
+
+    # ---- adaptive PV charging ------------------------------------------
+    def _eval_adaptive(self, states) -> AdaptiveResult:
+        """Compute the effective Max Charge SOC for this tick from the fleet + forecast."""
+        fleet_cap = sum(s.capacity for s in states if s.capacity)
+        weighted = [(s.soc, s.capacity) for s in states if s.soc is not None and s.capacity]
+        fleet_soc = (
+            sum(soc * cap for soc, cap in weighted) / sum(cap for _, cap in weighted)
+            if weighted else None
+        )
+        obs = AdaptiveObservation(
+            cap_soc=self.max_battery_soc,
+            fleet_soc=fleet_soc,
+            fleet_capacity_wh=fleet_cap,
+            remaining_pv_wh=self._read_remaining_pv_wh(),
+            hours_to_sunset=self._hours_to_sunset(),
+        )
+        return plan_adaptive_ceiling(obs, AdaptiveConfig(
+            enabled=self.adaptive_enabled,
+            ceiling_soc=self.adaptive_ceiling_soc,
+            baseline_load_w=self.adaptive_baseline_w,
+            forecast_derate=self.adaptive_forecast_derate,
+        ))
+
+    def _read_remaining_pv_wh(self) -> float | None:
+        """Solcast remaining-today forecast in Wh (the sensor reports kWh)."""
+        if not self.solcast_sensor:
+            return None
+        state = self.hass.states.get(self.solcast_sensor)
+        if state is None or state.state in ("unknown", "unavailable", None, ""):
+            return None
+        try:
+            return float(state.state) * 1000.0
+        except (ValueError, TypeError):
+            return None
+
+    def _hours_to_sunset(self) -> float:
+        """Hours of PV window left (0 when the sun is down), from the sun entity."""
+        state = self.hass.states.get(self.sun_sensor)
+        if state is None or state.state != "above_horizon":
+            return 0.0
+        nxt = state.attributes.get("next_setting")
+        if isinstance(nxt, str):
+            nxt = dt_util.parse_datetime(nxt)
+        elif not isinstance(nxt, datetime):
+            nxt = None
+        if nxt is None:
+            return 0.0
+        return max(0.0, (nxt - dt_util.utcnow()).total_seconds() / 3600.0)
+
+    def _adaptive_status(self) -> dict[str, Any]:
+        a = self._adaptive
+        if a is None:
+            return {
+                "status": "inactive", "effective_max_soc": self.max_battery_soc,
+                "fleet_headroom_wh": None, "remaining_surplus_wh": None, "open": False,
+            }
+        return {
+            "status": a.status, "effective_max_soc": a.effective_max_soc,
+            "fleet_headroom_wh": a.fleet_headroom_wh,
+            "remaining_surplus_wh": a.remaining_surplus_wh, "open": a.open,
+        }
 
     def _read_grid(self) -> tuple[float | None, bool, Any]:
         """Return (grid_power_w, fresh, sample_key). + = importing.
@@ -191,7 +276,14 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self) -> dict[str, Any]:
         now = time.monotonic()
         try:
-            readings, device_by_id = self._battery_readings()
+            states = self.bridge.read_all()
+            readings, device_by_id = self._battery_readings(states)
+            # Adaptive PV charging: raise the effective Max Charge SOC toward the
+            # ceiling when only the day's last rays remain, so the fleet crests
+            # near sunset instead of exporting the surplus. No-op (= cap) when
+            # disabled / no data / sun down.
+            self._adaptive = self._eval_adaptive(states)
+            self.planner.config.max_battery_soc = self._adaptive.effective_max_soc
             grid, fresh, key = self._read_grid()
             bridge = self._ev_bridging()
             obs = Observation(
@@ -234,6 +326,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             "setpoints": plan.setpoints,
             "safety": self.supervisor.status(now),
             "target_grid_w": self.controller.config.target_grid_w,
+            "adaptive": self._adaptive_status(),
         }
 
     def _error_status(self, err: str, now: float) -> dict[str, Any]:
@@ -243,6 +336,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             "command_total": 0, "setpoints": {},
             "safety": self.supervisor.status(now),
             "target_grid_w": self.controller.config.target_grid_w,
+            "adaptive": self._adaptive_status(),
         }
 
     def _log_transition(self, result: dict[str, Any], now: float) -> None:
