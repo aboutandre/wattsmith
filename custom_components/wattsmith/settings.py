@@ -44,9 +44,16 @@ DEFAULT_MAX_BATTERY_POWER: Final[int] = 2500
 
 # === Adaptive PV charging ====================================================
 DEFAULT_ADAPTIVE_CEILING_SOC: Final[float] = 100.0
-DEFAULT_ADAPTIVE_BASELINE_W: Final[float] = 500.0
+DEFAULT_ADAPTIVE_BASELINE_W: Final[float] = 500.0   # fallback until learner has enough data
 DEFAULT_ADAPTIVE_FORECAST_DERATE: Final[float] = 0.9
 DEFAULT_SUN_SENSOR: Final[str] = "sun.sun"
+
+# Baseline learner — rolling per-hour-of-day house-load averager.
+# The manager feeds it samples from HOUSE_CONSUMPTION_SENSOR each tick;
+# after MIN_SAMPLES readings in a given hour it replaces the fixed baseline.
+#   LEARN_WINDOW_DAYS  × 24 h × (3600/300) samples/h  =  ~2 k samples max.
+ADAPTIVE_LEARN_MIN_SAMPLES: Final[int] = 5          # readings/hour before trusting learned value
+HOUSE_CONSUMPTION_SENSOR: Final[str] = "sensor.house_consumption_power"
 
 # === EV charging (go-e) ======================================================
 EV_TICK_S: Final[float] = 15.0

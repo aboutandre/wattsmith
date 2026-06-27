@@ -114,8 +114,10 @@ working.
 | `sensor.wattsmith_adaptive_status` | sensor | `disabled` / `inactive` / `holding_at_cap` / `charging_to_ceiling` |
 | `sensor.wattsmith_adaptive_effective_max_soc` | sensor | SOC cap used this tick (%) |
 | `sensor.wattsmith_adaptive_fleet_headroom` | sensor | kWh left to ceiling |
+| `sensor.wattsmith_adaptive_learned_baseline` | sensor | Per-hour learned house load (W); falls back to `adaptive_baseline_load` while learning |
+| `sensor.wattsmith_adaptive_learned_hours` | sensor | How many hour-of-day slots have enough data (0–24) |
 | `number.wattsmith_adaptive_ceiling_soc` | number | Target SOC when gate opens (default 100%) |
-| `number.wattsmith_adaptive_baseline_load` | number | Estimated house load (W) for surplus calc |
+| `number.wattsmith_adaptive_baseline_load` | number | Fallback house load (W) until learner accumulates data |
 | `number.wattsmith_adaptive_forecast_derate` | number | Forecast confidence factor (0–1) |
 
 ### EV coordinator (go-e)
@@ -166,6 +168,12 @@ open_gate        = (fleet_soc > cap_soc + 0.5)  # already climbing → latch ope
                    OR remaining_pv_wh ≤ headroom_wh
 ```
 
+`baseline_load_w` is the **learned** per-hour-of-day average from
+`sensor.house_consumption_power` (rolling 7-day window, 5-min debounce, ≥5
+samples/hour before trusted). While learning it falls back to the configured
+`adaptive_baseline_load` constant. Sensor `sensor.wattsmith_adaptive_learned_hours`
+shows how many hours-of-day have sufficient data (target: 24).
+
 While the gate is closed, the effective max SOC is `max_battery_soc` (the
 normal cap). When it opens, the effective max SOC becomes `adaptive_ceiling_soc`
 (default 100%). The latch (`fleet_soc > cap_soc + 0.5`) keeps the gate open
@@ -187,14 +195,15 @@ Tibber price is below `cheap_price_threshold`.
 
 ```bash
 # Pure-logic tests (no Home Assistant or network required):
-python3 tests/test_controller.py    # 10 tests
-python3 tests/test_safety.py        #  5 tests
-python3 tests/test_planner.py       # 25 tests
-python3 tests/test_ev_planner.py    # 29 tests
-python3 tests/test_adaptive.py      # 15 tests
-python3 tests/test_binary_sensor.py #  5 tests
+python3 tests/test_controller.py     # 10 tests
+python3 tests/test_safety.py         #  5 tests
+python3 tests/test_planner.py        # 25 tests
+python3 tests/test_ev_planner.py     # 29 tests
+python3 tests/test_adaptive.py       # 15 tests
+python3 tests/test_baseline_learner.py # 15 tests  (in-memory learner; no HA)
+python3 tests/test_binary_sensor.py  #  5 tests
 python3 tests/test_battery_bridge.py # 22 tests  (HA-boundary; mocked registry)
-# Total: 111 tests
+# Total: 126 tests
 ```
 
 All settings (polling intervals, PD gains, SOC defaults, EV parameters) live in

@@ -24,6 +24,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .adaptive import AdaptiveConfig, AdaptiveObservation, AdaptiveResult, plan_adaptive_ceiling
+from .baseline_learner import BaselineLearner
 from .battery_bridge import BatteryBridge
 from .const import (
     CONF_ADAPTIVE_BASELINE_W,
@@ -58,6 +59,8 @@ from .settings import (
     DEFAULT_MIN_SOC,
     DEFAULT_SUN_SENSOR,
     DEFAULT_TARGET_GRID_W,
+    ADAPTIVE_LEARN_MIN_SAMPLES,
+    HOUSE_CONSUMPTION_SENSOR,
     MANAGER_BATTERY_FAIL_THRESHOLD,
     MANAGER_CD_TIME_S,
     MANAGER_CYCLE_FAIL_THRESHOLD,
@@ -95,6 +98,9 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         self.min_soc: float = float(entry.options.get(CONF_MIN_SOC, DEFAULT_MIN_SOC))
         self.max_battery_soc: float = float(entry.options.get(CONF_MAX_BATTERY_SOC, DEFAULT_MAX_BATTERY_SOC))
         self._read_adaptive_options()
+        # Rolling per-hour house-load learner — feeds observed consumption each
+        # tick and improves the adaptive gate's baseline over the first few hours.
+        self._learner = BaselineLearner(min_samples=ADAPTIVE_LEARN_MIN_SAMPLES)
         # Latest adaptive decision (published for the Adaptive entities).
         self._adaptive: AdaptiveResult | None = None
 
@@ -170,6 +176,16 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         return readings, device_by_id
 
     # ---- adaptive PV charging ------------------------------------------
+    def _read_house_consumption(self) -> float | None:
+        """Current house consumption from the template sensor (W), or None."""
+        state = self.hass.states.get(HOUSE_CONSUMPTION_SENSOR)
+        if state is None or state.state in ("unknown", "unavailable", None, ""):
+            return None
+        try:
+            return max(0.0, float(state.state))
+        except (ValueError, TypeError):
+            return None
+
     def _eval_adaptive(self, states) -> AdaptiveResult:
         """Compute the effective Max Charge SOC for this tick from the fleet + forecast."""
         fleet_cap = sum(s.capacity for s in states if s.capacity)
@@ -178,6 +194,10 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             sum(soc * cap for soc, cap in weighted) / sum(cap for _, cap in weighted)
             if weighted else None
         )
+        # Use the learned per-hour baseline if available; fall back to the
+        # configured constant while the learner is still accumulating data.
+        current_hour = datetime.now().hour
+        baseline_w = self._learner.baseline_for_hour(current_hour, self.adaptive_baseline_w)
         obs = AdaptiveObservation(
             cap_soc=self.max_battery_soc,
             fleet_soc=fleet_soc,
@@ -188,7 +208,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         return plan_adaptive_ceiling(obs, AdaptiveConfig(
             enabled=self.adaptive_enabled,
             ceiling_soc=self.adaptive_ceiling_soc,
-            baseline_load_w=self.adaptive_baseline_w,
+            baseline_load_w=baseline_w,
             forecast_derate=self.adaptive_forecast_derate,
         ))
 
@@ -220,15 +240,21 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
 
     def _adaptive_status(self) -> dict[str, Any]:
         a = self._adaptive
+        now_hour = datetime.now().hour
+        learned_w = self._learner.baseline_for_hour(now_hour, self.adaptive_baseline_w)
         if a is None:
             return {
                 "status": "inactive", "effective_max_soc": self.max_battery_soc,
                 "fleet_headroom_wh": None, "remaining_surplus_wh": None, "open": False,
+                "learned_baseline_w": learned_w,
+                "learned_hours_count": self._learner.learned_hours_count,
             }
         return {
             "status": a.status, "effective_max_soc": a.effective_max_soc,
             "fleet_headroom_wh": a.fleet_headroom_wh,
             "remaining_surplus_wh": a.remaining_surplus_wh, "open": a.open,
+            "learned_baseline_w": learned_w,
+            "learned_hours_count": self._learner.learned_hours_count,
         }
 
     def _read_grid(self) -> tuple[float | None, bool, Any]:
@@ -280,6 +306,10 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         try:
             states = self.bridge.read_all()
             readings, device_by_id = self._battery_readings(states)
+            # Feed the learned baseline from live sensor on every tick (debounced internally).
+            consumption = self._read_house_consumption()
+            if consumption is not None:
+                self._learner.observe(consumption)
             # Adaptive PV charging: raise the effective Max Charge SOC toward the
             # ceiling when only the day's last rays remain, so the fleet crests
             # near sunset instead of exporting the surplus. No-op (= cap) when
