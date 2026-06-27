@@ -20,6 +20,7 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
@@ -98,9 +99,12 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         self.min_soc: float = float(entry.options.get(CONF_MIN_SOC, DEFAULT_MIN_SOC))
         self.max_battery_soc: float = float(entry.options.get(CONF_MAX_BATTERY_SOC, DEFAULT_MAX_BATTERY_SOC))
         self._read_adaptive_options()
-        # Rolling per-hour house-load learner — feeds observed consumption each
-        # tick and improves the adaptive gate's baseline over the first few hours.
+        # Rolling per-(weekday, hour) house-load learner.  Feeds observed
+        # consumption each tick; persisted across restarts via HA storage.
         self._learner = BaselineLearner(min_samples=ADAPTIVE_LEARN_MIN_SAMPLES)
+        self._store: Store = Store(hass, 1, "wattsmith_learned_baseline")
+        self._baseline_loaded: bool = False       # lazy-load on first tick
+        self._last_baseline_save: float = 0.0    # monotonic; save at most hourly
         # Latest adaptive decision (published for the Adaptive entities).
         self._adaptive: AdaptiveResult | None = None
 
@@ -176,6 +180,22 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         return readings, device_by_id
 
     # ---- adaptive PV charging ------------------------------------------
+
+    async def _load_baseline(self) -> None:
+        """Load the persisted sample buffer from .storage/ on first tick."""
+        data = await self._store.async_load()
+        if data:
+            self._learner = BaselineLearner.from_dict(data, min_samples=ADAPTIVE_LEARN_MIN_SAMPLES)
+            _LOGGER.debug(
+                "Loaded baseline learner: %d samples, %d trusted slots",
+                self._learner.sample_count,
+                self._learner.learned_slots_count,
+            )
+
+    async def _save_baseline(self) -> None:
+        """Persist the sample buffer to .storage/ (called at most once per hour)."""
+        await self._store.async_save(self._learner.to_dict())
+
     def _read_house_consumption(self) -> float | None:
         """Current house consumption from the template sensor (W), or None."""
         state = self.hass.states.get(HOUSE_CONSUMPTION_SENSOR)
@@ -194,10 +214,10 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             sum(soc * cap for soc, cap in weighted) / sum(cap for _, cap in weighted)
             if weighted else None
         )
-        # Use the learned per-hour baseline if available; fall back to the
-        # configured constant while the learner is still accumulating data.
-        current_hour = datetime.now().hour
-        baseline_w = self._learner.baseline_for_hour(current_hour, self.adaptive_baseline_w)
+        # Use the learned per-(weekday, hour) baseline if available; fall back
+        # to the configured constant while the learner is still accumulating data.
+        _now = datetime.now()
+        baseline_w = self._learner.baseline_for_slot(_now.weekday(), _now.hour, self.adaptive_baseline_w)
         obs = AdaptiveObservation(
             cap_soc=self.max_battery_soc,
             fleet_soc=fleet_soc,
@@ -240,21 +260,21 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
 
     def _adaptive_status(self) -> dict[str, Any]:
         a = self._adaptive
-        now_hour = datetime.now().hour
-        learned_w = self._learner.baseline_for_hour(now_hour, self.adaptive_baseline_w)
+        _now = datetime.now()
+        learned_w = self._learner.baseline_for_slot(_now.weekday(), _now.hour, self.adaptive_baseline_w)
         if a is None:
             return {
                 "status": "inactive", "effective_max_soc": self.max_battery_soc,
                 "fleet_headroom_wh": None, "remaining_surplus_wh": None, "open": False,
                 "learned_baseline_w": learned_w,
-                "learned_hours_count": self._learner.learned_hours_count,
+                "learned_slots_count": self._learner.learned_slots_count,
             }
         return {
             "status": a.status, "effective_max_soc": a.effective_max_soc,
             "fleet_headroom_wh": a.fleet_headroom_wh,
             "remaining_surplus_wh": a.remaining_surplus_wh, "open": a.open,
             "learned_baseline_w": learned_w,
-            "learned_hours_count": self._learner.learned_hours_count,
+            "learned_slots_count": self._learner.learned_slots_count,
         }
 
     def _read_grid(self) -> tuple[float | None, bool, Any]:
@@ -303,6 +323,10 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
     # ---- the control tick ----------------------------------------------
     async def _async_update_data(self) -> dict[str, Any]:
         now = time.monotonic()
+        # Lazy-load persisted baseline on first tick (Store.async_load is async).
+        if not self._baseline_loaded:
+            self._baseline_loaded = True
+            await self._load_baseline()
         try:
             states = self.bridge.read_all()
             readings, device_by_id = self._battery_readings(states)
@@ -310,6 +334,10 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             consumption = self._read_house_consumption()
             if consumption is not None:
                 self._learner.observe(consumption)
+            # Persist the buffer at most once per hour so learned data survives restarts.
+            if now - self._last_baseline_save >= 3600:
+                await self._save_baseline()
+                self._last_baseline_save = now
             # Adaptive PV charging: raise the effective Max Charge SOC toward the
             # ceiling when only the day's last rays remain, so the fleet crests
             # near sunset instead of exporting the surplus. No-op (= cap) when

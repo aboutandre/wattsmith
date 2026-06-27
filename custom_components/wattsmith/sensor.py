@@ -63,7 +63,7 @@ ADAPTIVE_SENSORS: tuple[tuple[str, str, str | None, str | None, str], ...] = (
     ("effective_max_soc", "Adaptive Effective Max SOC", "%", "battery", "mdi:battery-charging-100"),
     ("fleet_headroom_wh", "Adaptive Fleet Headroom", "Wh", "energy", "mdi:battery-plus-variant"),
     ("learned_baseline_w", "Adaptive Learned Baseline", "W", "power", "mdi:chart-bell-curve"),
-    ("learned_hours_count", "Adaptive Learned Hours", None, None, "mdi:clock-check-outline"),
+    ("learned_slots_count", "Adaptive Learned Slots", None, None, "mdi:clock-check-outline"),
 )
 
 
