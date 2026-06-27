@@ -1,4 +1,9 @@
-"""Constants for the Wattsmith energy brain."""
+"""Constants for the Wattsmith energy brain.
+
+Identity + config keys only. All tunable defaults (timings, gains, thresholds,
+SOC limits, EV/adaptive params) live in settings.py — the single source of truth
+for the dials.
+"""
 from typing import Final
 
 DOMAIN: Final = "wattsmith"
@@ -22,8 +27,9 @@ BASE_SENSOR_CAPACITY: Final = "battery_capacity"     # attr bat_cap, Wh
 BASE_BATTERY_MARKER_SENSOR: Final = BASE_SENSOR_SOC
 
 # ---------------------------------------------------------------------------
-# Energy Manager (zero-grid multi-battery coordination)
+# Config / options keys (defaults for these live in settings.py)
 # ---------------------------------------------------------------------------
+# Energy Manager (zero-grid multi-battery coordination)
 CONF_GRID_SENSOR: Final = "grid_sensor"        # HA entity_id, + = import
 CONF_EV_SENSOR: Final = "ev_sensor"            # HA entity_id, EV charger power (excluded)
 CONF_TARGET_GRID_W: Final = "target_grid_w"
@@ -35,29 +41,7 @@ CONF_MAX_BATTERY_SOC: Final = "max_battery_soc"
 CONF_MAX_STEP_W: Final = "max_step_w"
 CONF_DIRECTION_HYSTERESIS_W: Final = "direction_hysteresis_w"
 
-DEFAULT_TARGET_GRID_W: Final = -50
-DEFAULT_KP: Final = 0.65
-DEFAULT_KD: Final = 0.2
-DEFAULT_DEADBAND_W: Final = 40
-DEFAULT_MIN_SOC: Final = 11
-DEFAULT_MAX_BATTERY_SOC: Final = 100
-DEFAULT_MAX_STEP_W: Final = 800
-DEFAULT_DIRECTION_HYSTERESIS_W: Final = 60
-DEFAULT_MAX_BATTERY_POWER: Final = 2500
-
-# Control timing
-MANAGER_TICK_S: Final = 3.0          # control loop period (proven cadence from live test)
-MANAGER_CD_TIME_S: Final = 10        # passive setpoint auto-revert (> tick)
-MANAGER_GRID_MAX_AGE_S: Final = 20.0 # grid sample older than this -> SAFE
-MANAGER_BATTERY_FAIL_THRESHOLD: Final = 3
-MANAGER_CYCLE_FAIL_THRESHOLD: Final = 3
-MANAGER_DEGRADED_THRESHOLD: Final = 3  # consecutive missed acks before flagging "degraded"
-MANAGER_RESEND_S: Final = 7.0          # re-arm setpoints only if last send older than this (< cd_time)
-
-# ---------------------------------------------------------------------------
-# Adaptive PV charging (dynamically raise the effective Max SOC toward a ceiling,
-# timed to crest near sunset — see adaptive.py)
-# ---------------------------------------------------------------------------
+# Adaptive PV charging
 CONF_ADAPTIVE_ENABLED: Final = "adaptive_enabled"
 CONF_ADAPTIVE_CEILING_SOC: Final = "adaptive_ceiling_soc"
 CONF_ADAPTIVE_BASELINE_W: Final = "adaptive_baseline_w"
@@ -65,14 +49,7 @@ CONF_ADAPTIVE_FORECAST_DERATE: Final = "adaptive_forecast_derate"
 CONF_SOLCAST_REMAINING_SENSOR: Final = "solcast_remaining_sensor"  # HA entity_id, remaining PV today
 CONF_SUN_SENSOR: Final = "sun_sensor"                             # HA entity_id, default sun.sun
 
-DEFAULT_ADAPTIVE_CEILING_SOC: Final = 100.0
-DEFAULT_ADAPTIVE_BASELINE_W: Final = 500.0
-DEFAULT_ADAPTIVE_FORECAST_DERATE: Final = 0.9
-DEFAULT_SUN_SENSOR: Final = "sun.sun"
-
-# ---------------------------------------------------------------------------
 # EV Coordinator (go-e local-API control)
-# ---------------------------------------------------------------------------
 CONF_GOE_IP: Final = "goe_ip"
 CONF_EV_MODE: Final = "ev_mode"
 CONF_RESERVE_SOC: Final = "reserve_soc"
@@ -84,15 +61,3 @@ CONF_PHASE_UP_W: Final = "phase_up_w"
 CONF_PHASE_DOWN_W: Final = "phase_down_w"
 CONF_BRIDGE_GRACE_S: Final = "bridge_grace_s"      # how long batteries bridge the car after surplus drops
 CONF_BRIDGE_FLOOR_SOC: Final = "bridge_floor_soc"  # stop bridging once fleet SOC falls to this
-
-DEFAULT_RESERVE_SOC: Final = 80.0
-DEFAULT_CHEAP_PRICE_THRESHOLD: Final = 0.10
-DEFAULT_EV_MODE: Final = "solar"
-DEFAULT_CHEAP_TARGET: Final = "car"
-DEFAULT_PHASE_UP_W: Final = 4500.0
-DEFAULT_PHASE_DOWN_W: Final = 4140.0
-DEFAULT_BRIDGE_GRACE_S: Final = 180.0
-DEFAULT_BRIDGE_FLOOR_SOC: Final = 50.0
-
-EV_TICK_S: Final = 15.0
-EV_GOE_TIMEOUT_S: Final = 5.0

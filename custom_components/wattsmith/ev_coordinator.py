@@ -41,6 +41,8 @@ from .const import (
     CONF_PHASE_UP_W,
     CONF_RESERVE_SOC,
     CONF_TIBBER_SENSOR,
+)
+from .settings import (
     DEFAULT_BRIDGE_FLOOR_SOC,
     DEFAULT_BRIDGE_GRACE_S,
     DEFAULT_CHEAP_PRICE_THRESHOLD,

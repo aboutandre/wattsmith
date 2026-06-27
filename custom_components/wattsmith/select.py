@@ -12,10 +12,9 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import (
     CONF_CHEAP_TARGET,
     CONF_EV_MODE,
-    DEFAULT_CHEAP_TARGET,
-    DEFAULT_EV_MODE,
     DOMAIN,
 )
+from .settings import DEFAULT_CHEAP_TARGET, DEFAULT_EV_MODE
 from .ev_coordinator import EvCoordinator
 from .ev_planner import TARGET_BATTERY, TARGET_BOTH, TARGET_CAR, TARGET_NONE
 

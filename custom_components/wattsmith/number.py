@@ -34,6 +34,9 @@ from .const import (
     CONF_PHASE_UP_W,
     CONF_RESERVE_SOC,
     CONF_TARGET_GRID_W,
+    DOMAIN,
+)
+from .settings import (
     DEFAULT_BRIDGE_FLOOR_SOC,
     DEFAULT_BRIDGE_GRACE_S,
     DEFAULT_CHEAP_PRICE_THRESHOLD,
@@ -41,7 +44,6 @@ from .const import (
     DEFAULT_PHASE_DOWN_W,
     DEFAULT_PHASE_UP_W,
     DEFAULT_RESERVE_SOC,
-    DOMAIN,
 )
 from .ev_coordinator import EvCoordinator
 from .manager import EnergyManagerCoordinator
