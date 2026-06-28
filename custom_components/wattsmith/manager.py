@@ -304,6 +304,23 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         ev_coord = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_ev")
         return bool(getattr(ev_coord, "bridge_active", False))
 
+    def _ev_solar_reserve_soc(self) -> float | None:
+        """Return the EV reserve SOC when the EV is actively solar-charging; else None.
+
+        When fleet SOC sits between the EV reserve and max_battery_soc both the
+        battery controller and the EV coordinator can be active simultaneously —
+        they compete for the same PV watts and pull from the grid.  While the EV
+        is in 'solar' state we cap battery charging at reserve_soc so the car
+        gets right-of-way for the surplus.  Once EV state leaves 'solar' (done,
+        waiting, or cheap mode) battery charging toward max_soc resumes.
+        """
+        ev_coord = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_ev")
+        if ev_coord is None or not getattr(ev_coord, "data", None):
+            return None
+        if ev_coord.data.get("state") != "solar":
+            return None
+        return ev_coord._planner.config.reserve_soc
+
     def _read_ev_raw(self) -> float | None:
         """Raw EV charger power, or None if unconfigured/unreadable (planner handles caching)."""
         if not self.ev_sensor:
@@ -344,6 +361,13 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             # disabled / no data / sun down.
             self._adaptive = self._eval_adaptive(states)
             self.planner.config.max_battery_soc = self._adaptive.effective_max_soc
+            # EV solar-charging right-of-way: hold batteries at reserve SOC so
+            # they don't compete with the car for the same PV watts.
+            ev_reserve = self._ev_solar_reserve_soc()
+            if ev_reserve is not None:
+                self.planner.config.max_battery_soc = min(
+                    self.planner.config.max_battery_soc, ev_reserve
+                )
             grid, fresh, key = self._read_grid()
             bridge = self._ev_bridging()
             obs = Observation(
