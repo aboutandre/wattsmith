@@ -20,6 +20,7 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util import dt as dt_util
 
 from .arbitrage import BatteryModel, Econ, build_buckets, plan_arbitrage, pv_slots_from_detailed
 from .battery_bridge import BatteryBridge
@@ -39,6 +40,7 @@ from .const import (
 from .economics import fleet_wear_cost_ct, wear_cost_ct_per_kwh
 from .settings import (
     ARBITRAGE_HORIZON_H,
+    DEFAULT_BATTERY_COST_EUR,
     DEFAULT_ETA_SEED,
     DEFAULT_EXPECTED_CYCLES,
     DEFAULT_MAX_BATTERY_SOC,
@@ -102,11 +104,15 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         per_battery = []
         batt_cfg = self.entry.options.get(CONF_BATTERY_CONFIG) or {}
         for st in self.bridge.read_all():
+            if not st.capacity:
+                continue
             b = batt_cfg.get(st.battery_id, {})
-            cost = b.get("cost_eur")
-            cycles = b.get("expected_cycles", DEFAULT_EXPECTED_CYCLES)
-            if cost and st.capacity:
-                per_battery.append((float(cost), float(cycles), float(st.capacity)))
+            # fall back to the conservative fleet default when a battery has no
+            # configured cost — never treat wear as 0 (that reads as "free" and
+            # makes arbitrage over-aggressive).
+            cost = float(b.get("cost_eur") or DEFAULT_BATTERY_COST_EUR)
+            cycles = float(b.get("expected_cycles") or DEFAULT_EXPECTED_CYCLES)
+            per_battery.append((cost, cycles, float(st.capacity)))
         w = fleet_wear_cost_ct(per_battery)
         return w if w is not None else 0.0
 
@@ -125,16 +131,26 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
 
     # ---- forecast inputs ------------------------------------------------
     async def _prices(self) -> list[tuple[float, float]]:
-        """Confirmed tariff prices as [(start_epoch, EUR/kWh)]. Tibber get_prices."""
+        """Confirmed tariff prices as [(start_epoch, EUR/kWh)]. Tibber get_prices.
+
+        MUST pass `end` — get_prices with no args returns TODAY ONLY, which caps
+        the horizon at midnight and defeats overnight arbitrage. `end` = now +
+        horizon pulls tomorrow's published curve (its evening peak is what makes
+        overnight grid-charging worthwhile).
+        """
+        end = (dt_util.now() + timedelta(hours=ARBITRAGE_HORIZON_H)).isoformat()
         try:
             resp = await self.hass.services.async_call(
-                "tibber", "get_prices", {}, blocking=True, return_response=True,
+                "tibber", "get_prices", {"end": end},
+                blocking=True, return_response=True,
             )
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("arbitrage: get_prices failed: %s", err)
             return []
+        # in-process HA returns the service_response directly; be robust to a wrapper
+        resp = (resp or {}).get("service_response", resp) or {}
         out: list[tuple[float, float]] = []
-        homes = (resp or {}).get("prices", {})
+        homes = resp.get("prices", {})
         for series in homes.values() if isinstance(homes, dict) else []:
             for p in series or []:
                 start = p.get("start_time") or p.get("startsAt")
