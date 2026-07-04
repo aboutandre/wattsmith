@@ -77,3 +77,21 @@ DEFAULT_PHASE_UP_W: Final[float] = 4500.0
 DEFAULT_PHASE_DOWN_W: Final[float] = 4140.0
 DEFAULT_BRIDGE_GRACE_S: Final[float] = 180.0
 DEFAULT_BRIDGE_FLOOR_SOC: Final[float] = 50.0
+
+# === History DB ==============================================================
+HISTORY_SAMPLE_INTERVAL_S: Final[float] = 10.0   # power sampling for energy integration
+HISTORY_RETENTION_DAYS: Final[int] = 0           # 0 = keep forever (the DB is the point)
+DEFAULT_EXPORT_PRICE: Final[float] = 0.07        # feed-in tariff EUR/kWh (opportunity cost)
+
+# === Battery economics / arbitrage ===========================================
+# Wear cost defaults: conservative amortised value = cost / (cycles × capacity).
+# Per-battery cost/cycles are configurable; these seed the fleet default.
+DEFAULT_BATTERY_COST_EUR: Final[float] = 1000.0
+DEFAULT_EXPECTED_CYCLES: Final[int] = 6000
+# Round-trip efficiency: SEED for the self-measuring estimator (measured ~78% in
+# the June regime; sharpens once real high-power discharge data arrives).
+DEFAULT_ETA_SEED: Final[float] = 0.78
+ETA_MIN_DSOC: Final[float] = 8.0                 # min SOC swing for a usable η segment
+DEFAULT_MIN_ARBITRAGE_MARGIN_CT: Final[float] = 1.5   # skip sub-margin churn
+ARBITRAGE_HORIZON_H: Final[float] = 36.0         # cap the planning horizon
+FLEET_CHARGE_POWER_W: Final[float] = 7500.0      # informational default (per-window energy cap)

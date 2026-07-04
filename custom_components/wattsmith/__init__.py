@@ -12,8 +12,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN
+from .const import CONF_HISTORY_ENABLED, DOMAIN
 from .ev_coordinator import EvCoordinator
+from .history_db import HistoryRecorder
 from .manager import EnergyManagerCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -49,6 +50,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id + "_ev"] = ev_coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    # History DB (default on): 15-min bucket logging + config versioning. Kept
+    # separate from control so a logging fault can never affect dispatch.
+    if entry.options.get(CONF_HISTORY_ENABLED, True):
+        recorder = HistoryRecorder(hass, entry)
+        try:
+            await recorder.async_start()
+            hass.data[DOMAIN][entry.entry_id + "_history"] = recorder
+        except Exception as err:  # noqa: BLE001 - logging must never block setup
+            _LOGGER.warning("Wattsmith history DB failed to start: %s", err)
+
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     _LOGGER.debug("Wattsmith entry %s set up", entry.entry_id)
     return True
@@ -72,6 +83,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if isinstance(ev_coord, EvCoordinator):
                 await ev_coord.async_release_wallbox()
             await ev_coord.async_shutdown()
+        recorder = hass.data[DOMAIN].pop(entry.entry_id + "_history", None)
+        if isinstance(recorder, HistoryRecorder):
+            await recorder.async_stop()
     return unload_ok
 
 
@@ -84,3 +98,7 @@ async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> Non
     ev_coord = domain_data.get(entry.entry_id + "_ev")
     if isinstance(ev_coord, EvCoordinator):
         await ev_coord.async_apply_options()
+    recorder = domain_data.get(entry.entry_id + "_history")
+    if isinstance(recorder, HistoryRecorder):
+        # version + record the config change for later effect-correlation
+        await recorder.async_on_config_change(source="options")

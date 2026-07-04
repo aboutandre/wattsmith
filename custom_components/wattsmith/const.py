@@ -68,3 +68,27 @@ CONF_PHASE_UP_W: Final = "phase_up_w"
 CONF_PHASE_DOWN_W: Final = "phase_down_w"
 CONF_BRIDGE_GRACE_S: Final = "bridge_grace_s"      # how long batteries bridge the car after surplus drops
 CONF_BRIDGE_FLOOR_SOC: Final = "bridge_floor_soc"  # stop bridging once fleet SOC falls to this
+
+# ---------------------------------------------------------------------------
+# History DB + arbitrage economics (Part A/B of the arbitrage spec)
+# ---------------------------------------------------------------------------
+# Extra logged inputs (options-configurable HA entity ids)
+CONF_PV_SENSOR: Final = "pv_sensor"                     # actual PV production (W)
+CONF_SOLCAST_FORECAST_SENSOR: Final = "solcast_forecast_sensor"  # detailed per-slot forecast
+CONF_WEATHER_SENSOR: Final = "weather_sensor"           # weather.* for outdoor temperature
+CONF_EXPORT_PRICE: Final = "export_price"               # feed-in tariff EUR/kWh (opportunity cost)
+
+# History DB
+CONF_HISTORY_ENABLED: Final = "history_enabled"
+CONF_HISTORY_DB_PATH: Final = "history_db_path"         # blank -> <config>/wattsmith/history.db
+CONF_HISTORY_RETENTION_DAYS: Final = "history_retention_days"  # 0 = keep forever
+
+# Per-battery economics (dict keyed by battery_id, values: cost_eur/expected_cycles/…)
+CONF_BATTERY_CONFIG: Final = "battery_config"
+
+# Arbitrage brain
+CONF_ARBITRAGE_ENABLED: Final = "arbitrage_enabled"
+CONF_WEAR_COST_CT: Final = "wear_cost_ct"              # EUR-cent/kWh delivered; blank -> derived
+CONF_ETA_OVERRIDE: Final = "eta_override"              # manual round-trip η (0-1); blank -> measured
+CONF_MIN_ARBITRAGE_MARGIN_CT: Final = "min_arbitrage_margin_ct"
+CONF_IMPORT_POWER_CAP_W: Final = "import_power_cap_w"   # 0 = no cap
