@@ -212,13 +212,7 @@ class WattsmithOptionsFlow(config_entries.OptionsFlow):
                                 default=int(cur.get("expected_cycles", DEFAULT_EXPECTED_CYCLES)))] = \
                 selector.NumberSelector(selector.NumberSelectorConfig(
                     min=100, max=20000, step=100, mode="box"))
-        return self.async_show_form(
-            step_id="economics", data_schema=vol.Schema(fields),
-            description_placeholders={
-                "info": "Wear cost / round-trip η blank = auto (derived / measured). "
-                "Per-battery: cost + expected cycles feed the wear cost; capacity auto-reads."
-            },
-        )
+        return self.async_show_form(step_id="economics", data_schema=vol.Schema(fields))
 
     # ---- history --------------------------------------------------------
     async def async_step_history(self, user_input=None) -> FlowResult:
@@ -244,13 +238,7 @@ class WattsmithOptionsFlow(config_entries.OptionsFlow):
             vol.Optional(CONF_HISTORY_DB_PATH, description=_suggest(o.get(CONF_HISTORY_DB_PATH, ""))):
                 selector.TextSelector(),
         })
-        return self.async_show_form(
-            step_id="history", data_schema=schema,
-            description_placeholders={
-                "info": "15-min analytical DB (never purged by default). "
-                "Retention 0 = keep forever. Path blank = <config>/wattsmith/history.db."
-            },
-        )
+        return self.async_show_form(step_id="history", data_schema=schema)
 
     # ---- helpers --------------------------------------------------------
     def _batteries(self) -> list[tuple[str, str]]:

@@ -17,14 +17,47 @@
     "step": {
       "init": {
         "title": "Wattsmith options",
-        "description": "{info}",
+        "menu_options": {
+          "sensors": "Sensors & devices",
+          "economics": "Battery economics & arbitrage",
+          "history": "History database"
+        }
+      },
+      "sensors": {
+        "title": "Sensors & devices",
+        "description": "Grid sensor: positive = importing. PV/EV/house sensors feed the history DB and arbitrage. go-e IP: leave blank to disable EV control. Tibber + car-state: needed for solar/cheap EV charging. Solcast (remaining + detailed forecast): enables adaptive PV charging and arbitrage. Weather: outdoor temperature for the history DB.",
         "data": {
-          "grid_sensor": "Grid power sensor",
-          "ev_sensor": "EV charger power sensor",
+          "grid_sensor": "Grid power sensor (+ = importing)",
+          "pv_sensor": "PV production sensor",
+          "ev_sensor": "EV charger power sensor (optional fallback)",
           "goe_ip": "go-e charger IP",
-          "tibber_sensor": "Electricity price sensor (Tibber)",
-          "car_state_sensor": "Car state sensor",
-          "solcast_remaining_sensor": "Solcast remaining-today sensor (adaptive PV charging)"
+          "tibber_sensor": "Electricity price sensor (Tibber, gross)",
+          "car_state_sensor": "Car state sensor (optional fallback)",
+          "solcast_remaining_sensor": "Solcast remaining-today sensor",
+          "solcast_forecast_sensor": "Solcast detailed-forecast sensor (per-slot)",
+          "house_consumption_sensor": "House consumption sensor",
+          "weather_sensor": "Weather entity (outdoor temperature)"
+        }
+      },
+      "economics": {
+        "title": "Battery economics & arbitrage",
+        "description": "Wear cost / round-trip efficiency blank = auto (derived / measured). Per-battery cost + expected cycles feed the wear cost; capacity auto-reads. Arbitrage control actuation is also toggled by the Arbitrage Control switch.",
+        "data": {
+          "arbitrage_enabled": "Enable arbitrage actuation",
+          "export_price": "Feed-in / export price (EUR/kWh)",
+          "min_arbitrage_margin_ct": "Minimum arbitrage margin (ct/kWh)",
+          "wear_cost_ct": "Battery wear cost override (ct/kWh, blank = derived)",
+          "eta_override": "Round-trip efficiency override (blank = measured)",
+          "import_power_cap_w": "Import power cap (W, blank/0 = none)"
+        }
+      },
+      "history": {
+        "title": "History database",
+        "description": "15-minute analytical DB, never purged by default. Retention 0 = keep forever. Path blank = <config>/wattsmith/history.db.",
+        "data": {
+          "history_enabled": "Enable history logging",
+          "history_retention_days": "Retention (days, 0 = keep forever)",
+          "history_db_path": "Database file path (blank = default)"
         }
       }
     }
