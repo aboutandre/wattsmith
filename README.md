@@ -102,10 +102,11 @@ All tunable numbers can be changed later via **Configure** (no restart needed).
 > **Migrating from an external charger integration** (e.g. `goecharger_api2`):
 > since v0.7.0 Wattsmith reads charger power + car state itself through the
 > wallbox driver, in the same HTTP call it already makes to reconcile the
-> charger. Once you've verified a charge cycle on v0.7.0, you can clear the two
-> fallback sensor fields and uninstall the external integration —
-> `sensor.wattsmith_ev_ev_power` replaces its power entity (recorder history
-> included).
+> charger. Once you've verified a charge cycle, you can clear the two fallback
+> sensor fields and uninstall the external integration — `EV Power` replaces its
+> power entity and `EV Car` replaces its car-state entity (recorder history
+> included). Repoint any dashboard cards / template sensors that referenced the
+> old entities first.
 
 The energy manager starts **disabled** on first install (safety — prevents a
 two-brain conflict if you're migrating from another controller). Enable via the
@@ -152,6 +153,7 @@ working.
 | `sensor.wattsmith_ev_ev_state` | sensor | Coordinator state |
 | `sensor.wattsmith_ev_ev_reason` | sensor | Human-readable reason for current state |
 | `sensor.wattsmith_ev_ev_power` | sensor | Actual charger power (W), read from the wallbox driver |
+| `sensor.wattsmith_ev_ev_car` | sensor | Car connection state: `disconnected` / `connected` / `charging` / `complete` |
 | `sensor.wattsmith_ev_ev_target_power` | sensor | Requested charge power (W) |
 | `sensor.wattsmith_ev_ev_charge_current` | sensor | Current commanded (A) |
 | `sensor.wattsmith_ev_ev_phases` | sensor | Phase count (1 or 3) |
@@ -241,9 +243,9 @@ python3 tests/test_validate_config.py  # 11 tests  (cross-value config checks)
 python3 tests/test_wallbox.py          # 21 tests  (driver contract + go-e parsing/params)
 python3 tests/test_binary_sensor.py    #  5 tests
 python3 tests/test_battery_bridge.py   # 22 tests  (HA-boundary; mocked registry)
-python3 tests/test_ev_coordinator.py   # 11 tests  (tick orchestration; faked driver/hass)
+python3 tests/test_ev_coordinator.py   # 13 tests  (tick orchestration; faked driver/hass)
 python3 tests/test_manager_tick.py     # 10 tests  (tick orchestration; faked bridge/hass)
-# Total: 186 tests
+# Total: 188 tests
 ```
 
 All settings (polling intervals, PD gains, SOC defaults, EV parameters) live in

@@ -244,6 +244,24 @@ def test_no_driver_observation_only():
     assert coord.wallbox_configured is False
 
 
+def test_car_label_native_states():
+    label = _evc._car_label
+    assert label(False, False, 0.0) == "disconnected"
+    assert label(True, False, 0.0) == "connected"
+    assert label(True, False, 1500.0) == "charging"
+    assert label(True, True, 0.0) == "complete"
+    # charging takes precedence over a stale 'done' flag
+    assert label(True, True, 1500.0) == "charging"
+
+
+def test_car_label_published_in_tick():
+    driver = FakeDriver([WallboxState(force=FORCE_ON, amp=6, phases=1,
+                                      power_w=1400.0, connected=True, done=False)])
+    coord = make_coord(BASE_OPTIONS, {"sensor.grid": -2000.0}, [_bat(soc=90.0, power=0)], driver)
+    data = _tick(coord)
+    assert data["car"] == "charging"
+
+
 def test_solar_reserve_surface_for_manager():
     driver = FakeDriver([WallboxState(force=FORCE_OFF, amp=6, phases=1,
                                       power_w=0.0, connected=True, done=False)])

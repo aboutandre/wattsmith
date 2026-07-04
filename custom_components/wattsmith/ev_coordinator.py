@@ -347,6 +347,7 @@ class EvCoordinator(DataUpdateCoordinator):
                 "bridge_active": plan.bridge_active,
                 "car_connected": connected,
                 "car_done": done,
+                "car": _car_label(connected, done, car_power_w),
                 "battery_soc": obs.battery_soc,
                 "battery_charge_w": battery_charge_w,
                 "grid_w": obs.grid_w,
@@ -364,12 +365,31 @@ class EvCoordinator(DataUpdateCoordinator):
                 "state": "error", "reason": str(err), "charge": False,
                 "amp": 0, "phases": self._last_phases, "target_power_w": 0,
                 "bridge_active": False,
-                "car_connected": False, "car_done": False,
+                "car_connected": False, "car_done": False, "car": "unknown",
                 "battery_soc": None, "battery_charge_w": 0.0, "grid_w": None, "price": None,
                 "ev_mode": self._ev_mode, "ev_power_w": None, "max_amp": None,
                 "wallbox_reachable": False,
                 "goe_configured": self._driver is not None,
             }
+
+
+_CAR_CHARGING_W = 100.0  # above this the car is drawing real charge power
+
+
+def _car_label(connected: bool, done: bool, power_w: float) -> str:
+    """Brand-neutral car connection state for the EV Car sensor.
+
+    A native replacement for an external charger integration's raw car-state
+    entity (e.g. go-e's Idle/Charging/Complete): disconnected / connected /
+    charging / complete — derived from what the coordinator already knows.
+    """
+    if not connected:
+        return "disconnected"
+    if power_w > _CAR_CHARGING_W:
+        return "charging"
+    if done:
+        return "complete"
+    return "connected"
 
 
 def _parse_car_state(value: str) -> tuple[bool, bool]:

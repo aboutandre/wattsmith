@@ -55,9 +55,11 @@ EV_SENSORS: tuple[tuple[str, str, str | None, str | None, str], ...] = (
     ("amp", "EV Charge Current", "A", "current", "mdi:current-ac"),
     ("phases", "EV Phases", None, None, "mdi:numeric"),
     ("target_power_w", "EV Target Power", "W", "power", "mdi:lightning-bolt"),
-    # actual charger power, read from the wallbox driver — replaces the need for
-    # an external charger integration's power sensor (recorder history included)
+    # actual charger power + car connection state, read from the wallbox driver —
+    # native replacements for an external charger integration's power / car-state
+    # entities (recorder history included), so that integration can be removed
     ("ev_power_w", "EV Power", "W", "power", "mdi:flash"),
+    ("car", "EV Car", None, None, "mdi:car-electric"),
 )
 
 # Adaptive PV charging sub-keys (read from coordinator.data["adaptive"]).
