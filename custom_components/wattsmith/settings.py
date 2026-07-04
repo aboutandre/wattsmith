@@ -53,11 +53,22 @@ DEFAULT_SUN_SENSOR: Final[str] = "sun.sun"
 # after MIN_SAMPLES readings in a given hour it replaces the fixed baseline.
 #   LEARN_WINDOW_DAYS  × 24 h × (3600/300) samples/h  =  ~2 k samples max.
 ADAPTIVE_LEARN_MIN_SAMPLES: Final[int] = 5          # readings/hour before trusting learned value
+# Default house-consumption entity; repointable in the options flow (F-14).
 HOUSE_CONSUMPTION_SENSOR: Final[str] = "sensor.house_consumption_power"
+# Warn (once, as a runtime warning on the status sensor) when adaptive charging is
+# enabled but the consumption sensor has been unreadable this long — the baseline
+# learner silently falls back to the configured constant otherwise.
+CONSUMPTION_STARVED_AFTER_S: Final[float] = 3600.0
 
-# === EV charging (go-e) ======================================================
+# === EV charging (wallbox-agnostic; brand specifics live in the driver) ======
 EV_TICK_S: Final[float] = 15.0
-EV_GOE_TIMEOUT_S: Final[float] = 5.0
+EV_GOE_TIMEOUT_S: Final[float] = 5.0          # go-e driver per-request HTTP timeout
+# Ride out brief driver/sensor blips without killing an active charge session;
+# past this, an unknown car state fails safe to "disconnected" (= stop).
+EV_CAR_STATE_GRACE_S: Final[float] = 30.0     # ~2 EV ticks
+# How long the last known charger power stays trustworthy (also the freshness
+# bound the manager uses for EV grid-exclusion when reading from the driver).
+EV_POWER_MAX_AGE_S: Final[float] = 45.0       # 3 EV ticks (< manager holds via planner)
 DEFAULT_EV_MODE: Final[str] = "solar"
 DEFAULT_RESERVE_SOC: Final[float] = 80.0
 DEFAULT_CHEAP_PRICE_THRESHOLD: Final[float] = 0.10

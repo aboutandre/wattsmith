@@ -55,6 +55,9 @@ EV_SENSORS: tuple[tuple[str, str, str | None, str | None, str], ...] = (
     ("amp", "EV Charge Current", "A", "current", "mdi:current-ac"),
     ("phases", "EV Phases", None, None, "mdi:numeric"),
     ("target_power_w", "EV Target Power", "W", "power", "mdi:lightning-bolt"),
+    # actual charger power, read from the wallbox driver — replaces the need for
+    # an external charger integration's power sensor (recorder history included)
+    ("ev_power_w", "EV Power", "W", "power", "mdi:flash"),
 )
 
 # Adaptive PV charging sub-keys (read from coordinator.data["adaptive"]).
@@ -98,7 +101,12 @@ class ManagerSensor(CoordinatorEntity, SensorEntity):
         if self._key != "state":
             return None
         data = self.coordinator.data or {}
-        return {"setpoints": data.get("setpoints"), "safety": data.get("safety")}
+        return {
+            "setpoints": data.get("setpoints"),
+            "safety": data.get("safety"),
+            # cross-value config sanity findings (F-17) — empty list = all clear
+            "config_warnings": data.get("config_warnings", []),
+        }
 
 
 class AdaptiveSensor(CoordinatorEntity, SensorEntity):
@@ -145,8 +153,8 @@ class EvSensor(CoordinatorEntity, SensorEntity):
         self._attr_device_info = {
             "identifiers": {(DOMAIN, entry_id + "_ev")},
             "name": f"{title} EV",
-            "manufacturer": "go-e",
-            "model": "EV Charger",
+            "manufacturer": "Wattsmith",
+            "model": "EV Charge Control",
             "via_device": (DOMAIN, entry_id),
         }
 

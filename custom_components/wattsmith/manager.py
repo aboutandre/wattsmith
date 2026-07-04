@@ -32,15 +32,21 @@ from .const import (
     CONF_ADAPTIVE_CEILING_SOC,
     CONF_ADAPTIVE_ENABLED,
     CONF_ADAPTIVE_FORECAST_DERATE,
+    CONF_BRIDGE_FLOOR_SOC,
     CONF_DEADBAND_W,
     CONF_DIRECTION_HYSTERESIS_W,
     CONF_EV_SENSOR,
+    CONF_GOE_IP,
     CONF_GRID_SENSOR,
+    CONF_HOUSE_CONSUMPTION_SENSOR,
     CONF_KD,
     CONF_KP,
     CONF_MAX_BATTERY_SOC,
     CONF_MAX_STEP_W,
     CONF_MIN_SOC,
+    CONF_PHASE_DOWN_W,
+    CONF_PHASE_UP_W,
+    CONF_RESERVE_SOC,
     CONF_SOLCAST_REMAINING_SENSOR,
     CONF_SUN_SENSOR,
     CONF_TARGET_GRID_W,
@@ -50,6 +56,7 @@ from .settings import (
     DEFAULT_ADAPTIVE_BASELINE_W,
     DEFAULT_ADAPTIVE_CEILING_SOC,
     DEFAULT_ADAPTIVE_FORECAST_DERATE,
+    DEFAULT_BRIDGE_FLOOR_SOC,
     DEFAULT_DEADBAND_W,
     DEFAULT_DIRECTION_HYSTERESIS_W,
     DEFAULT_KD,
@@ -58,9 +65,13 @@ from .settings import (
     DEFAULT_MAX_BATTERY_SOC,
     DEFAULT_MAX_STEP_W,
     DEFAULT_MIN_SOC,
+    DEFAULT_PHASE_DOWN_W,
+    DEFAULT_PHASE_UP_W,
+    DEFAULT_RESERVE_SOC,
     DEFAULT_SUN_SENSOR,
     DEFAULT_TARGET_GRID_W,
     ADAPTIVE_LEARN_MIN_SAMPLES,
+    CONSUMPTION_STARVED_AFTER_S,
     HOUSE_CONSUMPTION_SENSOR,
     MANAGER_BATTERY_FAIL_THRESHOLD,
     MANAGER_CD_TIME_S,
@@ -73,6 +84,7 @@ from .settings import (
 from .controller import ControllerConfig, ZeroGridController
 from .planner import BatteryReading, DispatchPlanner, Observation, Plan, PlannerConfig
 from .safety import SafetyConfig, SafetySupervisor
+from .validate_config import ConfigSnapshot, check_config
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -119,6 +131,14 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         self.planner = DispatchPlanner(self.controller, self.supervisor,
                                        self._build_planner_config())
         self._prev_state: str | None = None  # for transition logging
+        # Cross-value config sanity (F-17): computed at startup + every options
+        # change, surfaced on the status sensor and logged when it changes.
+        self.config_warnings: list[str] = []
+        self._refresh_config_warnings()
+        # Consumption-starvation runtime warning (F-14): warn once when adaptive
+        # is on but the house-consumption sensor has been unreadable for a while.
+        self._consumption_ok_ts: float = time.monotonic()
+        self._consumption_starved: bool = False
 
     # ---- configuration --------------------------------------------------
     def _opt(self, key: str, default: Any) -> Any:
@@ -131,6 +151,38 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         self.adaptive_forecast_derate: float = float(self._opt(CONF_ADAPTIVE_FORECAST_DERATE, DEFAULT_ADAPTIVE_FORECAST_DERATE))
         self.solcast_sensor: str | None = self._opt(CONF_SOLCAST_REMAINING_SENSOR, None) or None
         self.sun_sensor: str = self._opt(CONF_SUN_SENSOR, DEFAULT_SUN_SENSOR) or DEFAULT_SUN_SENSOR
+        self.house_consumption_sensor: str = (
+            self._opt(CONF_HOUSE_CONSUMPTION_SENSOR, HOUSE_CONSUMPTION_SENSOR)
+            or HOUSE_CONSUMPTION_SENSOR
+        )
+
+    def _refresh_config_warnings(self) -> None:
+        """Re-run the cross-value sanity checks (F-17); log when they change."""
+        ev_coord = self._ev_coordinator()
+        snapshot = ConfigSnapshot(
+            min_soc=self.min_soc,
+            max_battery_soc=self.max_battery_soc,
+            adaptive_enabled=self.adaptive_enabled,
+            adaptive_ceiling_soc=self.adaptive_ceiling_soc,
+            ev_configured=bool(
+                getattr(ev_coord, "wallbox_configured", False)
+                or self.ev_sensor
+                # at startup the EV coordinator doesn't exist yet — fall back to
+                # the raw option so EV checks still apply from the first tick
+                or self._opt(CONF_GOE_IP, None)
+            ),
+            reserve_soc=float(self._opt(CONF_RESERVE_SOC, DEFAULT_RESERVE_SOC)),
+            bridge_floor_soc=float(self._opt(CONF_BRIDGE_FLOOR_SOC, DEFAULT_BRIDGE_FLOOR_SOC)),
+            phase_up_w=float(self._opt(CONF_PHASE_UP_W, DEFAULT_PHASE_UP_W)),
+            phase_down_w=float(self._opt(CONF_PHASE_DOWN_W, DEFAULT_PHASE_DOWN_W)),
+        )
+        warnings = check_config(snapshot)
+        if warnings != self.config_warnings:
+            for w in warnings:
+                _LOGGER.warning("Config check: %s", w)
+            if not warnings and self.config_warnings:
+                _LOGGER.info("Config check: all clear")
+        self.config_warnings = warnings
 
     def _build_controller_config(self) -> ControllerConfig:
         return ControllerConfig(
@@ -165,6 +217,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         self._read_adaptive_options()
         self.controller.config = self._build_controller_config()
         self.planner.config = self._build_planner_config()
+        self._refresh_config_warnings()
 
     # ---- HA I/O (gathering observations) -------------------------------
     def _battery_readings(self, states) -> tuple[list[BatteryReading], dict[str, str]]:
@@ -197,14 +250,46 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         await self._store.async_save(self._learner.to_dict())
 
     def _read_house_consumption(self) -> float | None:
-        """Current house consumption from the template sensor (W), or None."""
-        state = self.hass.states.get(HOUSE_CONSUMPTION_SENSOR)
+        """Current house consumption from the configured sensor (W), or None."""
+        state = self.hass.states.get(self.house_consumption_sensor)
         if state is None or state.state in ("unknown", "unavailable", None, ""):
             return None
         try:
             return max(0.0, float(state.state))
         except (ValueError, TypeError):
             return None
+
+    def _track_consumption_health(self, consumption: float | None, now: float) -> None:
+        """F-14: surface (once) when the baseline learner is silently starving."""
+        if consumption is not None:
+            if self._consumption_starved:
+                _LOGGER.info("House-consumption sensor %s readable again",
+                             self.house_consumption_sensor)
+            self._consumption_ok_ts = now
+            self._consumption_starved = False
+            return
+        if (
+            self.adaptive_enabled
+            and not self._consumption_starved
+            and now - self._consumption_ok_ts >= CONSUMPTION_STARVED_AFTER_S
+        ):
+            self._consumption_starved = True
+            _LOGGER.warning(
+                "House-consumption sensor %s has been unreadable for over an hour — "
+                "the adaptive baseline learner is falling back to the configured "
+                "constant (%.0f W)",
+                self.house_consumption_sensor, self.adaptive_baseline_w,
+            )
+
+    def _runtime_warnings(self) -> list[str]:
+        """Config warnings + transient runtime warnings for the status sensor."""
+        warnings = list(self.config_warnings)
+        if self._consumption_starved:
+            warnings.append(
+                f"house-consumption sensor {self.house_consumption_sensor} unreadable — "
+                "baseline learner starving (using fallback constant)"
+            )
+        return warnings
 
     def _eval_adaptive(self, states) -> AdaptiveResult:
         """Compute the effective Max Charge SOC for this tick from the fleet + forecast."""
@@ -294,35 +379,59 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         age = (dt_util.utcnow() - state.last_updated).total_seconds()
         return value, age <= MANAGER_GRID_MAX_AGE_S, state.last_changed
 
+    def _ev_coordinator(self):
+        """The sibling EV coordinator (registered under "<entry_id>_ev"), or None.
+
+        Coupling contract (F-16): only the EV coordinator's PUBLIC surface is
+        used — bridge_active, solar_reserve_soc, wallbox_configured,
+        ev_power_recent(). Accessed via getattr with safe defaults so a missing/
+        old coordinator degrades gracefully instead of raising.
+        """
+        return self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_ev")
+
     def _ev_bridging(self) -> bool:
         """True when the EV coordinator wants the batteries to carry the car this tick.
 
         During a battery bridge we must NOT exclude the EV load — the whole point is for
         the home batteries to cover the car through a brief PV-surplus dip instead of
-        importing. The EV coordinator is registered alongside us under "<entry_id>_ev".
+        importing.
         """
-        ev_coord = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_ev")
-        return bool(getattr(ev_coord, "bridge_active", False))
+        return bool(getattr(self._ev_coordinator(), "bridge_active", False))
 
     def _ev_solar_reserve_soc(self) -> float | None:
-        """Return the EV reserve SOC when the EV is actively solar-charging; else None.
+        """The EV reserve SOC while the EV is actively solar-charging; else None.
 
         When fleet SOC sits between the EV reserve and max_battery_soc both the
         battery controller and the EV coordinator can be active simultaneously —
         they compete for the same PV watts and pull from the grid.  While the EV
         is in 'solar' state we cap battery charging at reserve_soc so the car
-        gets right-of-way for the surplus.  Once EV state leaves 'solar' (done,
-        waiting, or cheap mode) battery charging toward max_soc resumes.
+        gets right-of-way for the surplus (this deliberately overrides the
+        adaptive ceiling too: car first, then batteries soak the rest).
         """
-        ev_coord = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_ev")
-        if ev_coord is None or not getattr(ev_coord, "data", None):
-            return None
-        if ev_coord.data.get("state") != "solar":
-            return None
-        return ev_coord._planner.config.reserve_soc
+        return getattr(self._ev_coordinator(), "solar_reserve_soc", None)
+
+    @property
+    def _ev_configured(self) -> bool:
+        """An EV load exists to exclude: a wallbox driver and/or a power sensor."""
+        if self.ev_sensor:
+            return True
+        return bool(getattr(self._ev_coordinator(), "wallbox_configured", False))
 
     def _read_ev_raw(self) -> float | None:
-        """Raw EV charger power, or None if unconfigured/unreadable (planner handles caching)."""
+        """Raw EV charger power, or None if unconfigured/unreadable this tick.
+
+        Source priority: the wallbox driver's own reading (via the EV
+        coordinator, freshness-bounded) — this is what makes an external
+        charger integration unnecessary — then the optional EV power sensor
+        as fallback. The planner caches brief gaps (ev_max_age_s) and HOLDs
+        on a sustained unknown.
+        """
+        ev_coord = self._ev_coordinator()
+        power_recent = getattr(ev_coord, "ev_power_recent", None)
+        if callable(power_recent):
+            value = power_recent()
+            if value is not None:
+                return float(value)
         if not self.ev_sensor:
             return None
         state = self.hass.states.get(self.ev_sensor)
@@ -349,6 +458,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             readings, device_by_id = self._battery_readings(states)
             # Feed the learned baseline from live sensor on every tick (debounced internally).
             consumption = self._read_house_consumption()
+            self._track_consumption_health(consumption, now)
             if consumption is not None:
                 self._learner.observe(consumption)
             # Persist the buffer at most once per hour so learned data survives restarts.
@@ -372,7 +482,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             bridge = self._ev_bridging()
             obs = Observation(
                 now=now, enabled=self.enabled, grid_value=grid, grid_fresh=fresh,
-                grid_key=key, ev_configured=self.ev_sensor is not None,
+                grid_key=key, ev_configured=self._ev_configured,
                 # bridge: fold the car back into the load the batteries zero out
                 ev_raw=0.0 if bridge else self._read_ev_raw(), batteries=readings,
             )
@@ -411,6 +521,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             "safety": self.supervisor.status(now),
             "target_grid_w": self.controller.config.target_grid_w,
             "adaptive": self._adaptive_status(),
+            "config_warnings": self._runtime_warnings(),
         }
 
     def _error_status(self, err: str, now: float) -> dict[str, Any]:
@@ -421,6 +532,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             "safety": self.supervisor.status(now),
             "target_grid_w": self.controller.config.target_grid_w,
             "adaptive": self._adaptive_status(),
+            "config_warnings": self._runtime_warnings(),
         }
 
     def _log_transition(self, result: dict[str, Any], now: float) -> None:

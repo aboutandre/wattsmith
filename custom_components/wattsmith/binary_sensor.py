@@ -27,9 +27,10 @@ def is_reserve_conflict(reserve_soc: float, max_charge_soc: float) -> bool:
 
     In EV "solar" mode the cascade fills the home batteries up to Reserve SOC
     *before* the car. If Reserve > Max Charge SOC, the fleet is capped below the
-    reserve and can never reach it — so the car never starts on solar. Equal is
-    fine (the fleet reaches exactly the reserve, then the cascade moves to the
-    car). Pure + unit-tested.
+    reserve and can never reach it. Since v0.7.0 the EV coordinator CLAMPS the
+    effective reserve to the cap (validate_config.effective_reserve_soc), so the
+    car still solar-charges — this sensor now flags that the configured value is
+    misleading rather than a hard failure. Equal is fine. Pure + unit-tested.
     """
     return reserve_soc > max_charge_soc
 
@@ -83,7 +84,8 @@ class ReserveConflictBinarySensor(CoordinatorEntity, BinarySensorEntity):
         if is_reserve_conflict(reserve, max_charge):
             attrs["detail"] = (
                 f"EV Reserve SOC ({reserve:.0f}%) is above Max Charge SOC "
-                f"({max_charge:.0f}%): the car will not charge on solar. "
-                f"Lower Reserve SOC or raise Max Charge SOC."
+                f"({max_charge:.0f}%): the effective reserve is clamped to "
+                f"{max_charge:.0f}%. Lower Reserve SOC or raise Max Charge SOC "
+                f"so the setting matches actual behavior."
             )
         return attrs

@@ -55,7 +55,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
+    """Unload a config entry — release everything Wattsmith was commanding.
+
+    Batteries go back to Auto; the wallbox goes back to its own default logic
+    (force → neutral). Without the wallbox release, uninstalling the brain
+    mid-session would strand the charger in a forced state forever (it has no
+    cd_time-style auto-revert like the batteries do).
+    """
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         coordinator = hass.data[DOMAIN].pop(entry.entry_id, None)
         if isinstance(coordinator, EnergyManagerCoordinator):
@@ -63,6 +69,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await coordinator.async_shutdown()
         ev_coord = hass.data[DOMAIN].pop(entry.entry_id + "_ev", None)
         if ev_coord is not None:
+            if isinstance(ev_coord, EvCoordinator):
+                await ev_coord.async_release_wallbox()
             await ev_coord.async_shutdown()
     return unload_ok
 

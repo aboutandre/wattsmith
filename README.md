@@ -18,9 +18,10 @@ Wattsmith owns all the decisions.
   charging/discharging the battery fleet, split across batteries by state of
   charge, with safety fallbacks (grid-staleness, per-battery health, bad-cycle
   watchdog → SAFE).
-- **EV charging (go-e)** — PV-surplus priority cascade, cheap-window grid
-  charging, automatic 1↔3-phase switching, and a battery-bridge for brief PV
-  dips.
+- **EV charging** — PV-surplus priority cascade, cheap-window grid charging,
+  automatic 1↔3-phase switching, and a battery-bridge for brief PV dips.
+  Charger brands are pluggable **wallbox drivers** (currently: go-e via its
+  local HTTP API); the planner and coordinator are brand-agnostic.
 - **Adaptive PV charging** — reactive gate that holds the battery fleet at its
   normal SOC cap through the day, then opens to the ceiling only when remaining
   forecast surplus ≤ headroom, so the fill to 100% lands on the last hours of
@@ -48,8 +49,22 @@ in `tests/`:
 | `planner.py` | Energy-manager decision logic |
 | `ev_planner.py` | EV charge planning (cascade, cheap window, phase switching) |
 | `adaptive.py` | Adaptive PV ceiling gate (pure function, no HA) |
-| `binary_sensor.py` | `is_reserve_conflict()` helper (EV reserve vs max-SOC deadlock) |
+| `validate_config.py` | Cross-value config sanity checks (reserve↔cap clamp, phase thresholds, …) |
+| `wallbox.py` | Brand-agnostic wallbox contract: `WallboxDriver`, normalized state, drift reconcile |
+| `wallbox_goe.py` | go-e driver (local HTTP API v2: frc/psm/car/nrg/cll, acs/trx auth) |
+| `binary_sensor.py` | `is_reserve_conflict()` helper (EV reserve vs max-SOC) |
 | `battery_bridge.py` | HA-boundary: discovers base batteries, reads states, calls services |
+
+### Wallbox drivers
+
+Everything charger-brand-specific lives behind `wallbox.WallboxDriver` (read
+actual state / apply command / release). The EV coordinator **reconciles the
+charger to the plan every tick** — it never assumes the hardware remembers its
+last command (the go-e provably resets its force state on unplug, restart and
+by its own internal logic). Supporting a new charger brand = one new
+`wallbox_<brand>.py` module implementing three methods; the planner,
+coordinator, entities and tests are untouched. The driver also supplies charger
+power and car state, so **no separate charger integration is required**.
 
 ## Install
 
@@ -77,11 +92,20 @@ All tunable numbers can be changed later via **Configure** (no restart needed).
 | Field | Example entity | Notes |
 |---|---|---|
 | Grid power sensor | `sensor.shellypro3em_power` | + = import, − = export |
-| EV charger power sensor | `sensor.goe_nrg_11` | excluded from house load calc |
-| Solcast remaining sensor | `sensor.solcast_forecast_remaining_today` | kWh |
-| go-e charger IP | `192.168.x.x` | EV coordinator |
+| Wallbox (go-e) IP | `192.168.x.x` | enables EV control; the driver also reads charger power, car state and hardware amp limits directly |
 | Tibber price sensor | `sensor.tibber_current_price` | cheap-window charging |
-| Car state sensor | `sensor.goe_car_value` | go-e raw car state (1-4) |
+| Solcast remaining sensor | `sensor.solcast_forecast_remaining_today` | kWh; enables adaptive charging |
+| House consumption sensor | `sensor.house_consumption_power` | feeds the baseline learner (default shown) |
+| EV charger power sensor | *(optional)* | fallback only — used when the wallbox driver can't be read |
+| Car state sensor | *(optional)* | fallback only — same |
+
+> **Migrating from an external charger integration** (e.g. `goecharger_api2`):
+> since v0.7.0 Wattsmith reads charger power + car state itself through the
+> wallbox driver, in the same HTTP call it already makes to reconcile the
+> charger. Once you've verified a charge cycle on v0.7.0, you can clear the two
+> fallback sensor fields and uninstall the external integration —
+> `sensor.wattsmith_ev_ev_power` replaces its power entity (recorder history
+> included).
 
 The energy manager starts **disabled** on first install (safety — prevents a
 two-brain conflict if you're migrating from another controller). Enable via the
@@ -120,25 +144,32 @@ working.
 | `number.wattsmith_adaptive_baseline_load` | number | Fallback house load (W) until learner accumulates data |
 | `number.wattsmith_adaptive_forecast_derate` | number | Forecast confidence factor (0–1) |
 
-### EV coordinator (go-e)
+### EV coordinator
 
 | Entity | Type | Description |
 |---|---|---|
-| `select.wattsmith_ev_ev_charging_mode` | select | `solar` / `cheap` / `off` |
+| `select.wattsmith_ev_ev_charging_mode` | select | `off` / `solar` / `solar_cheap` / `fast` |
 | `sensor.wattsmith_ev_ev_state` | sensor | Coordinator state |
 | `sensor.wattsmith_ev_ev_reason` | sensor | Human-readable reason for current state |
+| `sensor.wattsmith_ev_ev_power` | sensor | Actual charger power (W), read from the wallbox driver |
 | `sensor.wattsmith_ev_ev_target_power` | sensor | Requested charge power (W) |
 | `sensor.wattsmith_ev_ev_charge_current` | sensor | Current commanded (A) |
 | `sensor.wattsmith_ev_ev_phases` | sensor | Phase count (1 or 3) |
-| `number.wattsmith_ev_ev_reserve_soc` | number | Fleet SOC gate before solar charging starts |
+| `number.wattsmith_ev_ev_reserve_soc` | number | Fleet SOC gate before solar charging starts (clamped to Max Charge SOC) |
 | `number.wattsmith_ev_ev_cheap_price` | number | Price threshold for cheap-window charging |
-| `select.wattsmith_ev_ev_cheap_price_target` | select | Target SOC during cheap window |
+| `select.wattsmith_ev_ev_cheap_price_target` | select | `none` / `car` — what the cheap window charges |
 
 ### Config-conflict guard
 
 | Entity | Type | Description |
 |---|---|---|
-| `binary_sensor.wattsmith_ev_reserve_max_charge_soc_conflict` | binary_sensor (problem) | On when EV Reserve SOC > Max Charge SOC — the fleet can never reach the reserve, so the car silently never charges on solar |
+| `binary_sensor.wattsmith_ev_reserve_max_charge_soc_conflict` | binary_sensor (problem) | On when EV Reserve SOC > Max Charge SOC. The effective reserve is auto-clamped to the cap (the car still solar-charges); the sensor flags that the configured value is misleading |
+
+Additionally, `sensor.wattsmith_status` carries a `config_warnings` attribute:
+every cross-value clash found by `validate_config.check_config()` (reserve vs
+cap, min vs max SOC, adaptive ceiling vs cap, phase up vs down thresholds,
+bridge floor vs reserve, baseline-learner starvation) — empty list = all clear.
+Warnings are also logged whenever they change.
 
 ## Control model
 
@@ -191,23 +222,28 @@ In `solar` mode the priority order is:
 3. EV charging (PV surplus above reserve).
 4. Batteries → up to 100% alongside the EV.
 
-`cheap` mode skips the cascade and charges directly from the grid when the
-Tibber price is below `cheap_price_threshold`.
+`solar_cheap` mode follows the same cascade, but additionally charges the car
+at full power whenever the Tibber price is at or below `cheap_price_threshold`
+(and the cheap-price target includes the car). `fast` charges at maximum power
+regardless of price or PV.
 
 ## Development
 
 ```bash
-# Pure-logic tests (no Home Assistant or network required):
-python3 tests/test_controller.py     # 10 tests
-python3 tests/test_safety.py         #  5 tests
-python3 tests/test_planner.py        # 25 tests
-python3 tests/test_ev_planner.py     # 29 tests
-python3 tests/test_ev_reconcile.py   # 13 tests  (go-e drift correction; HA imports stubbed)
-python3 tests/test_adaptive.py       # 15 tests
-python3 tests/test_baseline_learner.py # 22 tests  (learner + persistence; no HA)
-python3 tests/test_binary_sensor.py  #  5 tests
-python3 tests/test_battery_bridge.py # 22 tests  (HA-boundary; mocked registry)
-# Total: 146 tests
+# All tests run without Home Assistant or network:
+python3 tests/test_controller.py       # 10 tests  (pure)
+python3 tests/test_safety.py           #  5 tests  (pure)
+python3 tests/test_planner.py          # 25 tests  (pure)
+python3 tests/test_ev_planner.py       # 29 tests  (pure)
+python3 tests/test_adaptive.py         # 15 tests  (pure)
+python3 tests/test_baseline_learner.py # 22 tests  (learner + persistence)
+python3 tests/test_validate_config.py  # 11 tests  (cross-value config checks)
+python3 tests/test_wallbox.py          # 21 tests  (driver contract + go-e parsing/params)
+python3 tests/test_binary_sensor.py    #  5 tests
+python3 tests/test_battery_bridge.py   # 22 tests  (HA-boundary; mocked registry)
+python3 tests/test_ev_coordinator.py   # 11 tests  (tick orchestration; faked driver/hass)
+python3 tests/test_manager_tick.py     # 10 tests  (tick orchestration; faked bridge/hass)
+# Total: 186 tests
 ```
 
 All settings (polling intervals, PD gains, SOC defaults, EV parameters) live in

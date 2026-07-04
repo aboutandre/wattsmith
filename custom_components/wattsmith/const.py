@@ -49,8 +49,15 @@ CONF_ADAPTIVE_FORECAST_DERATE: Final = "adaptive_forecast_derate"
 CONF_SOLCAST_REMAINING_SENSOR: Final = "solcast_remaining_sensor"  # HA entity_id, remaining PV today
 CONF_SUN_SENSOR: Final = "sun_sensor"                             # HA entity_id, default sun.sun
 
-# EV Coordinator (go-e local-API control)
-CONF_GOE_IP: Final = "goe_ip"
+# Manager: house-consumption input for the baseline learner (options-repointable;
+# the default entity id lives in settings.py)
+CONF_HOUSE_CONSUMPTION_SENSOR: Final = "house_consumption_sensor"
+
+# EV Coordinator (wallbox control — brand selected via CONF_WALLBOX_TYPE,
+# specifics implemented by the matching wallbox_* driver module)
+CONF_WALLBOX_TYPE: Final = "wallbox_type"
+WALLBOX_TYPE_GOE: Final = "goe"
+CONF_GOE_IP: Final = "goe_ip"      # driver host/IP (key name kept for compat)
 CONF_EV_MODE: Final = "ev_mode"
 CONF_RESERVE_SOC: Final = "reserve_soc"
 CONF_CHEAP_PRICE_THRESHOLD: Final = "cheap_price_threshold"

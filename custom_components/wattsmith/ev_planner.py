@@ -49,6 +49,11 @@ class EvPlannerConfig:
     max_amp: int = 16                # cable/adapter limit (this go-e: 16 A)
     phase_voltage: float = 230.0
     reserve_soc: float = 80.0        # batteries get PV priority below this; car gets it above
+    # Tolerance on the reserve gate. The battery manager stops charging AT the
+    # cap, and the gate reads the MINIMUM fleet SOC — without tolerance, one
+    # battery hovering just under an exactly-reached reserve blocks the car
+    # forever while the surplus exports (audit F-17 equality fragility).
+    reserve_tolerance_soc: float = 1.0
     cheap_price: float = 0.10        # EUR/kWh threshold for the cheap window
     # phase switching (3-phase needs ~3x the power of 1-phase at the same amps)
     phase_up_w: float = 4500.0       # surplus to step UP to 3-phase (3ph min ~4140 + margin)
@@ -154,7 +159,7 @@ class EvChargePlanner:
 
         # Surplus is sufficient, but if the batteries are below their reserve the PV should
         # refill them first — don't (start) solar-charging the car here.
-        if obs.battery_soc < cfg.reserve_soc:
+        if obs.battery_soc < cfg.reserve_soc - cfg.reserve_tolerance_soc:
             self._surplus_dropped_at = None
             return self._maybe_stop(
                 obs, "waiting",

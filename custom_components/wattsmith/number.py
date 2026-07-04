@@ -199,8 +199,8 @@ class EvNumberEntity(CoordinatorEntity, NumberEntity):
         self._attr_device_info = {
             "identifiers": {(DOMAIN, entry.entry_id + "_ev")},
             "name": f"{entry.title} EV",
-            "manufacturer": "go-e",
-            "model": "EV Charger",
+            "manufacturer": "Wattsmith",
+            "model": "EV Charge Control",
             "via_device": (DOMAIN, entry.entry_id),
         }
 
