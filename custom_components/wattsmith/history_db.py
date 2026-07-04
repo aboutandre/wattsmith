@@ -363,6 +363,8 @@ class HistoryRecorder:
         self._config_version = 1
         self._unsub = None
         self._started = False
+        # latest arbitrage advisory, stamped onto the bucket when it flushes
+        self._advisory: tuple[float, str, float, float] | None = None
 
     # ---- lifecycle ------------------------------------------------------
     async def async_start(self) -> None:
@@ -623,8 +625,19 @@ class HistoryRecorder:
         finally:
             conn.close()
 
+    def note_advisory(self, grid_charge_wh: float, reason: str,
+                      eta: float, wear_eur_per_kwh: float) -> None:
+        """Record the current arbitrage advisory; stamped onto the next flush."""
+        self._advisory = (grid_charge_wh, reason, eta, wear_eur_per_kwh)
+
     async def _flush(self, accum: BucketAccumulator) -> None:
         row = accum.bucket_row(self._config_version)
+        if self._advisory is not None:
+            gc, reason, eta, wear = self._advisory
+            row["grid_charge_wh"] = round(gc, 2)
+            row["arb_reason"] = reason
+            row["eta_used"] = eta
+            row["wear_used"] = wear
         brows = accum.battery_rows()
         await self.hass.async_add_executor_job(self._write_bucket, row, brows)
 

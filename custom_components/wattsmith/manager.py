@@ -220,17 +220,25 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         self._refresh_config_warnings()
 
     # ---- HA I/O (gathering observations) -------------------------------
-    def _battery_readings(self, states) -> tuple[list[BatteryReading], dict[str, str]]:
+    def _battery_readings(
+        self, states, min_soc: float | None = None
+    ) -> tuple[list[BatteryReading], dict[str, str]]:
         """Build planner readings + a battery_id -> device_id map for dispatch."""
+        floor = self.min_soc if min_soc is None else min_soc
         readings: list[BatteryReading] = []
         device_by_id: dict[str, str] = {}
         for st in states:
             readings.append(BatteryReading(
                 id=st.battery_id, soc=st.soc, power=st.power, read_ok=st.available,
-                min_soc=self.min_soc, max_power=DEFAULT_MAX_BATTERY_POWER,
+                min_soc=floor, max_power=DEFAULT_MAX_BATTERY_POWER,
             ))
             device_by_id[st.battery_id] = st.device_id
         return readings, device_by_id
+
+    def _arb_hold_floor_soc(self) -> float | None:
+        """Arbitrage discharge-hold floor (only when the Arbitrage switch is on)."""
+        arb = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_arb")
+        return getattr(arb, "hold_floor_soc", None)
 
     # ---- adaptive PV charging ------------------------------------------
 
@@ -455,7 +463,14 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             await self._load_baseline()
         try:
             states = self.bridge.read_all()
-            readings, device_by_id = self._battery_readings(states)
+            # Arbitrage discharge-hold (Phase 4, gated by the Arbitrage switch):
+            # protect grid-bought / earmarked energy from leaking into cheaper
+            # intermediate deficits by raising the effective min-SOC floor. Only
+            # ever RAISES the floor (never imports) — safe. The grid-CHARGE side
+            # stays advisory until validated on live data (see docs).
+            hold = self._arb_hold_floor_soc()
+            effective_min_soc = self.min_soc if hold is None else max(self.min_soc, hold)
+            readings, device_by_id = self._battery_readings(states, effective_min_soc)
             # Feed the learned baseline from live sensor on every tick (debounced internally).
             consumption = self._read_house_consumption()
             self._track_consumption_health(consumption, now)

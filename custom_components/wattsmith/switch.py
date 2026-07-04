@@ -10,7 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_ADAPTIVE_ENABLED, DOMAIN
+from .const import CONF_ADAPTIVE_ENABLED, CONF_ARBITRAGE_ENABLED, DOMAIN
 from .manager import EnergyManagerCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -23,10 +23,14 @@ async def async_setup_entry(
 ) -> None:
     """Set up the Energy Manager switches."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([
+    switches = [
         WattsmithEnableSwitch(coordinator, entry),
         AdaptiveEnableSwitch(coordinator, entry),
-    ])
+    ]
+    arb = hass.data[DOMAIN].get(entry.entry_id + "_arb")
+    if arb is not None:
+        switches.append(ArbitrageEnableSwitch(arb, entry))
+    async_add_entities(switches)
 
 
 class WattsmithEnableSwitch(CoordinatorEntity, SwitchEntity):
@@ -92,6 +96,46 @@ class AdaptiveEnableSwitch(CoordinatorEntity, SwitchEntity):
         self.hass.config_entries.async_update_entry(
             self.coordinator.entry, options=new_options
         )
+        await self.coordinator.async_request_refresh()
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self._set(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._set(False)
+
+
+class ArbitrageEnableSwitch(CoordinatorEntity, SwitchEntity):
+    """Enable tariff-arbitrage ACTUATION (discharge-hold + grid-charge).
+
+    Default OFF: with the switch off the arbitrage brain still computes and logs
+    its plan (advisory — visible on the Arbitrage sensors and in the history DB),
+    but never changes dispatch. Turn on only after validating the advisory plan
+    against the logged data.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:cash-sync"
+
+    def __init__(self, coordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_arbitrage_enabled"
+        self._attr_name = "Arbitrage Control"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": entry.title,
+            "manufacturer": "Wattsmith",
+            "model": "Energy Brain",
+        }
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._entry.options.get(CONF_ARBITRAGE_ENABLED, False))
+
+    async def _set(self, value: bool) -> None:
+        new_options = {**self._entry.options, CONF_ARBITRAGE_ENABLED: value}
+        self.hass.config_entries.async_update_entry(self._entry, options=new_options)
         await self.coordinator.async_request_refresh()
 
     async def async_turn_on(self, **kwargs: Any) -> None:

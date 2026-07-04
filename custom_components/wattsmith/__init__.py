@@ -12,6 +12,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
+from .arbitrage_coordinator import ArbitrageCoordinator
 from .const import CONF_HISTORY_ENABLED, DOMAIN
 from .ev_coordinator import EvCoordinator
 from .history_db import HistoryRecorder
@@ -48,6 +49,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data[DOMAIN][entry.entry_id] = coordinator
     hass.data[DOMAIN][entry.entry_id + "_ev"] = ev_coordinator
+
+    # Advisory arbitrage brain (Phase 3): computes the grid-charge / discharge-hold
+    # plan + economics. Purely advisory until the Arbitrage switch is enabled.
+    arbitrage = ArbitrageCoordinator(hass, entry)
+    await arbitrage.async_config_entry_first_refresh()
+    hass.data[DOMAIN][entry.entry_id + "_arb"] = arbitrage
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # History DB (default on): 15-min bucket logging + config versioning. Kept
@@ -83,6 +91,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if isinstance(ev_coord, EvCoordinator):
                 await ev_coord.async_release_wallbox()
             await ev_coord.async_shutdown()
+        hass.data[DOMAIN].pop(entry.entry_id + "_arb", None)
         recorder = hass.data[DOMAIN].pop(entry.entry_id + "_history", None)
         if isinstance(recorder, HistoryRecorder):
             await recorder.async_stop()

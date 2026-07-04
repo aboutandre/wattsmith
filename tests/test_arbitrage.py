@@ -104,6 +104,43 @@ def test_hold_floor_protects_earmarked_energy():
     assert plan.hold_floor_soc > charged.min_soc
 
 
+def test_build_buckets_aligns_and_bounds_horizon():
+    now = 900.0  # bucket-aligned
+    prices = [(0.0, 0.10), (3600.0, 0.30)]   # hour 0 = 10 ct, hour 1 = 30 ct
+    pv = {900: 500.0}
+    load = [400.0] * 24
+    buckets = a.build_buckets(now, prices, pv, load, horizon_h=2.0)
+    # prices known through the end of hour 1 (last start 3600 + 1h grace = 7200):
+    # slots 900,1800,...,6300 = 7 slots
+    assert len(buckets) == 7
+    assert buckets[0].price_ct == 10.0 and buckets[0].pv_wh == 500.0
+    assert buckets[0].load_wh == 400.0
+    assert buckets[-1].price_ct == 30.0   # carried forward into hour 1's slots
+
+
+def test_build_buckets_stops_past_confirmed_prices():
+    prices = [(0.0, 0.10)]            # only hour 0 published
+    buckets = a.build_buckets(0.0, prices, {}, None, horizon_h=6.0)
+    # emits hour-0 slots then stops once >1h past the last published start
+    assert 0 < len(buckets) <= 8
+
+
+def test_build_buckets_empty_without_prices():
+    assert a.build_buckets(0.0, [], {}, None) == []
+
+
+def test_pv_slots_from_detailed_splits_30min():
+    periods = [{"period_start": "1970-01-01T00:00:00+00:00", "pv_estimate": 2.0}]
+    slots = a.pv_slots_from_detailed(periods)
+    # 2 kW × 0.25 h × 1000 = 500 Wh in each of the two 15-min sub-slots
+    assert slots[0] == 500.0 and slots[900] == 500.0
+
+
+def test_pv_slots_skips_bad_periods():
+    assert a.pv_slots_from_detailed([{"pv_estimate": 1.0}]) == {}   # no start
+    assert a.pv_slots_from_detailed([{"period_start": "nope", "pv_estimate": 1}]) == {}
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

@@ -26,6 +26,15 @@ Wattsmith owns all the decisions.
   normal SOC cap through the day, then opens to the ceiling only when remaining
   forecast surplus ≤ headroom, so the fill to 100% lands on the last hours of
   sun (zero feed-in, zero evening import).
+- **Tariff arbitrage** *(advisory by default)* — a forward 15-min simulation +
+  merit-order planner that grid-charges the fleet in cheap spot-price windows
+  only when it beats *effective* cost (price ÷ measured round-trip η + battery
+  wear), and protects that energy for the expensive windows it was bought for.
+  Computes and logs its plan; actuation is gated behind the Arbitrage switch.
+- **History DB** — a dedicated, never-purged SQLite log of 15-minute energy
+  buckets (PV, house, EV, grid, per-battery charge/discharge/SOC, prices) plus
+  full **config versioning**, at `config/wattsmith/history.db`, for offline
+  pattern analysis and to correlate config changes to their effects.
 
 ## Architecture
 
@@ -49,6 +58,9 @@ in `tests/`:
 | `planner.py` | Energy-manager decision logic |
 | `ev_planner.py` | EV charge planning (cascade, cheap window, phase switching) |
 | `adaptive.py` | Adaptive PV ceiling gate (pure function, no HA) |
+| `economics.py` | Battery economics: wear cost, effective cost, EFC/SoH, self-measured η |
+| `arbitrage.py` | Forward 15-min sim + merit-order arbitrage decision (pure) |
+| `history_db.py` | 15-min bucket logging + config versioning (executor/SQLite shell) |
 | `validate_config.py` | Cross-value config sanity checks (reserve↔cap clamp, phase thresholds, …) |
 | `wallbox.py` | Brand-agnostic wallbox contract: `WallboxDriver`, normalized state, drift reconcile |
 | `wallbox_goe.py` | go-e driver (local HTTP API v2: frc/psm/car/nrg/cll, acs/trx auth) |
@@ -245,7 +257,10 @@ python3 tests/test_binary_sensor.py    #  5 tests
 python3 tests/test_battery_bridge.py   # 22 tests  (HA-boundary; mocked registry)
 python3 tests/test_ev_coordinator.py   # 13 tests  (tick orchestration; faked driver/hass)
 python3 tests/test_manager_tick.py     # 10 tests  (tick orchestration; faked bridge/hass)
-# Total: 188 tests
+python3 tests/test_history_db.py       # 12 tests  (pure helpers + real SQLite round-trip)
+python3 tests/test_economics.py        #  8 tests  (wear, effective cost, η estimator)
+python3 tests/test_arbitrage.py        # 12 tests  (forward sim + merit-order + bucket builder)
+# Total: 220 tests
 ```
 
 All settings (polling intervals, PD gains, SOC defaults, EV parameters) live in

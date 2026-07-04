@@ -37,6 +37,11 @@ async def async_setup_entry(
         entities.extend(
             EvSensor(ev_coord, entry.entry_id, entry.title, d) for d in EV_SENSORS
         )
+    arb = hass.data[DOMAIN].get(entry.entry_id + "_arb")
+    if arb is not None:
+        entities.extend(
+            ArbitrageSensor(arb, entry.entry_id, entry.title, d) for d in ARBITRAGE_SENSORS
+        )
     async_add_entities(entities)
 
 
@@ -60,6 +65,16 @@ EV_SENSORS: tuple[tuple[str, str, str | None, str | None, str], ...] = (
     # entities (recorder history included), so that integration can be removed
     ("ev_power_w", "EV Power", "W", "power", "mdi:flash"),
     ("car", "EV Car", None, None, "mdi:car-electric"),
+)
+
+# Arbitrage advisory + economics (read from the arbitrage coordinator).
+ARBITRAGE_SENSORS: tuple[tuple[str, str, str | None, str | None, str], ...] = (
+    ("reason", "Arbitrage Plan", None, None, "mdi:cash-clock"),
+    ("grid_charge_now_wh", "Arbitrage Grid Charge Now", "Wh", "energy", "mdi:transmission-tower-import"),
+    ("profitable_deficit_wh", "Arbitrage Profitable Deficit", "Wh", "energy", "mdi:cash-plus"),
+    ("hold_floor_soc", "Arbitrage Discharge Hold SOC", "%", "battery", "mdi:battery-lock"),
+    ("eta", "Round-Trip Efficiency", None, None, "mdi:sync"),
+    ("wear_ct", "Battery Wear Cost", None, None, "mdi:battery-heart-variant"),
 )
 
 # Adaptive PV charging sub-keys (read from coordinator.data["adaptive"]).
@@ -136,6 +151,47 @@ class AdaptiveSensor(CoordinatorEntity, SensorEntity):
     def native_value(self) -> Any:
         adaptive = (self.coordinator.data or {}).get("adaptive") or {}
         return adaptive.get(self._key)
+
+
+class ArbitrageSensor(CoordinatorEntity, SensorEntity):
+    """Advisory arbitrage + economics sensor (reads the arbitrage coordinator)."""
+
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator, entry_id, title, desc) -> None:
+        super().__init__(coordinator)
+        key, name, unit, device_class, icon = desc
+        self._key = key
+        self._attr_name = name
+        self._attr_native_unit_of_measurement = unit
+        self._attr_device_class = device_class
+        self._attr_icon = icon
+        self._attr_unique_id = f"{entry_id}_arb_{key}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry_id)},
+            "name": title,
+            "manufacturer": "Wattsmith",
+            "model": "Energy Brain",
+        }
+
+    @property
+    def native_value(self) -> Any:
+        value = (self.coordinator.data or {}).get(self._key)
+        if self._key == "eta" and value is not None:
+            return round(value * 100.0, 1)      # show as %
+        return value
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        if self._key != "reason":
+            return None
+        data = self.coordinator.data or {}
+        return {
+            "enabled": data.get("enabled"),
+            "eta_source": data.get("eta_source"),
+            "target_soc": data.get("target_soc"),
+            "horizon_buckets": data.get("horizon_buckets"),
+        }
 
 
 class EvSensor(CoordinatorEntity, SensorEntity):

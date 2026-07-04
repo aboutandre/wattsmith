@@ -21,6 +21,7 @@ Rolling: recomputed every tick; only the current-window action is acted on.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from .economics import effective_cost_ct, is_profitable
 
@@ -32,6 +33,96 @@ class Bucket:
     price_ct: float      # import price, EUR-cent/kWh (gross)
     pv_wh: float         # forecast PV production this bucket
     load_wh: float       # forecast house load this bucket (excl. car)
+
+
+def build_buckets(
+    now_ts: float,
+    prices: list[tuple[float, float]],
+    pv_by_slot: dict[int, float],
+    load_by_hour: list[float] | None,
+    horizon_h: float = 36.0,
+) -> list[Bucket]:
+    """Align confirmed prices + PV forecast + load into 15-min Bucket list.
+
+    Pure + testable. buckets[0] covers `now`.
+      - prices: [(start_epoch, EUR/kWh), ...] at whatever cadence the tariff
+        publishes (hourly or 15-min); the covering price is carried forward.
+      - pv_by_slot: {bucket_start_epoch: forecast_Wh} (from Solcast detail).
+      - load_by_hour: 24-length Wh/bucket by hour-of-day (learned baseline / 4),
+        or None to assume a flat 0 (deficit only from explicit load).
+    Only buckets with a confirmed price are emitted (no price forecasting).
+    """
+    if not prices:
+        return []
+    prices = sorted(prices)
+    start = int(now_ts // 900) * 900
+    end = start + int(horizon_h * 3600)
+    buckets: list[Bucket] = []
+    ts = start
+    while ts < end:
+        price = _price_at(prices, ts)
+        if price is None:
+            break  # beyond the confirmed horizon
+        pv = pv_by_slot.get(ts, 0.0)
+        if load_by_hour:
+            hour = int((ts % 86400) // 3600)
+            load = load_by_hour[hour % 24]
+        else:
+            load = 0.0
+        buckets.append(Bucket(price_ct=price * 100.0, pv_wh=pv, load_wh=load))
+        ts += 900
+    return buckets
+
+
+def pv_slots_from_detailed(periods: list[dict]) -> dict[int, float]:
+    """Solcast detailed forecast -> {bucket_start_epoch: forecast_Wh per 15-min}.
+
+    Each period is {period_start: iso, pv_estimate: kW-average}. Energy in a
+    15-min slot = pv_estimate(kW) × 0.25 h × 1000 = Wh. A 30-min period seeds
+    both of its 15-min sub-slots. Any unparsable period is skipped.
+    """
+    out: dict[int, float] = {}
+    for p in periods:
+        start = p.get("period_start")
+        est = p.get("pv_estimate")
+        if start is None or est is None:
+            continue
+        if isinstance(start, str):
+            try:
+                dt = datetime.fromisoformat(start)
+            except ValueError:
+                continue
+        elif isinstance(start, datetime):
+            dt = start
+        else:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        try:
+            wh = float(est) * 0.25 * 1000.0
+        except (ValueError, TypeError):
+            continue
+        base = int(dt.timestamp() // 900) * 900
+        # a Solcast period is 30 min -> fill both 15-min sub-slots
+        out[base] = wh
+        out[base + 900] = wh
+    return out
+
+
+def _price_at(prices: list[tuple[float, float]], ts: int) -> float | None:
+    """Price (EUR/kWh) of the published interval covering `ts`, or None if past end."""
+    covering = None
+    for start, price in prices:
+        if start <= ts:
+            covering = price
+        else:
+            # ts is before this interval; covering holds the last one that started <= ts
+            break
+    # guard: if ts is beyond the last published interval + its width, treat as unknown
+    last_start = prices[-1][0]
+    if ts >= last_start + 3600:   # >1h past the last published start -> unknown
+        return None
+    return covering
 
 
 @dataclass(frozen=True)
