@@ -202,11 +202,12 @@ python3 tests/test_controller.py     # 10 tests
 python3 tests/test_safety.py         #  5 tests
 python3 tests/test_planner.py        # 25 tests
 python3 tests/test_ev_planner.py     # 29 tests
+python3 tests/test_ev_reconcile.py   # 13 tests  (go-e drift correction; HA imports stubbed)
 python3 tests/test_adaptive.py       # 15 tests
 python3 tests/test_baseline_learner.py # 22 tests  (learner + persistence; no HA)
 python3 tests/test_binary_sensor.py  #  5 tests
 python3 tests/test_battery_bridge.py # 22 tests  (HA-boundary; mocked registry)
-# Total: 133 tests
+# Total: 146 tests
 ```
 
 All settings (polling intervals, PD gains, SOC defaults, EV parameters) live in

@@ -8,7 +8,12 @@ All decision logic lives in ev_planner.py (pure, unit-tested). This module only:
   - publishes status for HA sensor entities.
 
 Runs as a DataUpdateCoordinator. The tick never raises: any failure is recorded and
-the last plan is left in place (go-e remembers its last frc/amp/psm across ticks).
+the last plan is left in place.
+
+Each tick the coordinator reconciles the go-e's *actual* frc/amp/psm against the plan
+and re-asserts on any drift — it does NOT assume the charger remembers its last command.
+A go-e reboot/firmware/app reset can silently revert frc to 0 (charge-by-default); the
+per-tick reconcile catches that and re-sends the desired state (see reconcile_goe).
 
 If go-e IP is not configured the coordinator runs silently without sending any commands.
 """
@@ -145,23 +150,48 @@ class EvCoordinator(DataUpdateCoordinator):
 
     # ---- go-e control ---------------------------------------------------
 
+    async def _read_goe_state(self) -> dict[str, int] | None:
+        """Read the go-e's actual frc/amp/psm, or None if unreachable/unparseable.
+
+        None means "could not verify" — the caller then re-asserts the plan to be safe.
+        """
+        try:
+            session = async_get_clientsession(self.hass)
+            url = f"http://{self._goe_ip}/api/status"
+            timeout = aiohttp.ClientTimeout(total=EV_GOE_TIMEOUT_S)
+            async with session.get(url, params={"filter": "frc,amp,psm"}, timeout=timeout) as resp:
+                if resp.status != 200:
+                    _LOGGER.debug("go-e status HTTP %s", resp.status)
+                    return None
+                data = await resp.json()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("go-e status read failed: %s", err)
+            return None
+        out: dict[str, int] = {}
+        for key in ("frc", "amp", "psm"):
+            try:
+                out[key] = int(data[key])
+            except (KeyError, TypeError, ValueError):
+                pass
+        return out
+
     async def _apply_plan(self, plan: EvPlan) -> None:
         if not self._goe_ip:
             return
-        prev = self._last_plan
-        if (
-            prev is not None
-            and prev.charge == plan.charge
-            and prev.amp == plan.amp
-            and prev.phases == plan.phases
-        ):
-            return  # no change — don't hammer the charger
 
-        frc = "2" if plan.charge else "1"
-        params: dict[str, str] = {"frc": frc}
-        if plan.charge:
-            params["amp"] = str(plan.amp)
-            params["psm"] = "1" if plan.phases == 1 else "2"
+        actual = await self._read_goe_state()
+        params = reconcile_goe(plan, actual)
+        if params is None:
+            # go-e already matches the plan — nothing to send (don't hammer the charger).
+            self._last_amp = plan.amp
+            self._last_phases = plan.phases
+            self._last_plan = plan
+            return
+
+        # actual is not None but mismatched → the charger drifted from the plan (e.g. it
+        # reset frc to 0). Surface it: this is the desync that let the car charge unbidden.
+        if actual is not None:
+            _LOGGER.info("go-e drifted from plan (actual=%s, want=%s) — re-asserting", actual, params)
 
         try:
             session = async_get_clientsession(self.hass)
@@ -171,8 +201,7 @@ class EvCoordinator(DataUpdateCoordinator):
                 if resp.status != 200:
                     _LOGGER.warning("go-e returned HTTP %s for %s", resp.status, params)
                     return
-            _LOGGER.debug("go-e set: frc=%s amp=%s psm=%s", frc,
-                          params.get("amp", "-"), params.get("psm", "-"))
+            _LOGGER.debug("go-e set: %s", params)
             self._last_amp = plan.amp
             self._last_phases = plan.phases
             self._last_plan = plan
@@ -259,6 +288,39 @@ class EvCoordinator(DataUpdateCoordinator):
                 "battery_soc": None, "battery_charge_w": 0.0, "grid_w": None, "price": None,
                 "ev_mode": self._ev_mode, "goe_configured": bool(self._goe_ip),
             }
+
+
+def reconcile_goe(plan: EvPlan, actual: dict[str, int] | None) -> dict[str, str] | None:
+    """Decide what to write to the go-e so it matches ``plan``.
+
+    Pure decision helper (unit-tested). Returns the ``/api/set`` params to send, or
+    ``None`` if the charger is already in the desired state and no write is needed.
+
+    ``actual`` is the go-e's real state ``{"frc", "amp", "psm"}`` (ints), or ``None``
+    when it could not be read — in which case we always (re)assert the plan to be safe.
+
+    go-e frc: 0 = neutral/charge-by-default, 1 = off (never charge), 2 = force charge.
+    A stale frc=0 is exactly what let the car draw grid power while the planner said "off",
+    so "off" must be actively held as frc=1, never left implicit.
+    """
+    desired_frc = 2 if plan.charge else 1
+    params: dict[str, str] = {"frc": str(desired_frc)}
+    if plan.charge:
+        params["amp"] = str(plan.amp)
+        params["psm"] = "1" if plan.phases == 1 else "2"
+
+    if actual is None:
+        return params  # cannot verify → assert the desired state
+
+    if actual.get("frc") != desired_frc:
+        return params
+    if plan.charge:
+        if actual.get("amp") != plan.amp:
+            return params
+        desired_psm = 1 if plan.phases == 1 else 2
+        if actual.get("psm") != desired_psm:
+            return params
+    return None  # already in sync
 
 
 def _parse_car_state(value: str) -> tuple[bool, bool]:
