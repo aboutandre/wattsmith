@@ -69,6 +69,30 @@ def test_empty_battery_list_no_crash():
     assert c.update(grid_power=1500, batteries=[]) == {}
 
 
+# ---- grid-charge actuation: positive grid target = deliberate import ----------
+def test_positive_target_charges_toward_import_cap():
+    # Arbitrage grid-charge sets target_grid_w = +7500 (import). With batteries
+    # below max_soc and grid near zero, the loop must command a CHARGE (negative).
+    c = ZeroGridController(ControllerConfig(target_grid_w=7500, kp=1.0, kd=0.0,
+                                            deadband_w=0, max_step_w=10000))
+    sp = c.update(grid_power=0, batteries=_bats([30, 30, 30]))
+    assert sum(sp.values()) < 0                     # charging
+    assert all(v <= 0 for v in sp.values())
+
+
+def test_full_fleet_never_discharges_to_chase_import_target():
+    # The safety property the manager relies on: once the fleet reaches its
+    # (arbitrage-capped) max_soc, charge_cap is 0, so even with a big positive
+    # import target the controller must NOT discharge to "reach" it.
+    c = ZeroGridController(ControllerConfig(target_grid_w=7500, kp=1.0, kd=0.0,
+                                            deadband_w=0, max_step_w=10000))
+    full = [BatteryState(id=f"b{i}", soc=60.0, min_soc=11, max_soc=60.0)
+            for i in range(3)]
+    sp = c.update(grid_power=0, batteries=full)     # grid < target -> big + error
+    assert all(v == 0 for v in sp.values())         # no discharge-to-chase
+    assert sum(sp.values()) == 0
+
+
 def test_deadband_holds_without_kick():
     # Regression: entering the deadband must not produce a derivative kick.
     c = ZeroGridController()  # default target -50, kd=0.2, deadband 30

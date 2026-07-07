@@ -249,6 +249,72 @@ def test_consumption_starvation_warns_once_adaptive_on():
     assert not any("starving" in w for w in result["config_warnings"])
 
 
+def _fake_arb(enabled=True, target_soc=None, grid_charge_now_wh=0.0, hold_floor_soc=None):
+    return SimpleNamespace(
+        enabled=enabled,
+        charge_floor_soc=target_soc,
+        hold_floor_soc=hold_floor_soc,
+        data={"grid_charge_now_wh": grid_charge_now_wh, "target_soc": target_soc},
+    )
+
+
+def test_arbitrage_grid_charge_flips_target_and_caps_soc():
+    # switch on + planner wants to buy this bucket + fleet below target ->
+    # grid target flips positive (import) and the charge is capped at target SOC.
+    mgr = make_manager({"import_power_cap_w": 7500},
+                       {"sensor.grid": _grid_state(0)}, [_bat(soc=30.0)])
+    mgr.hass.data.setdefault(DOMAIN, {})["mgr_entry_arb"] = _fake_arb(
+        target_soc=60.0, grid_charge_now_wh=1875.0)
+    result = _tick(mgr)
+    assert result["arb_charging"] is True
+    assert result["target_grid_w"] == 7500                 # importing on purpose
+    assert mgr.planner.config.max_battery_soc == 60.0       # capped at earmark
+    assert result["command_total"] < 0                      # charging
+
+
+def test_arbitrage_no_charge_when_already_at_target():
+    # fleet already at/above the target -> no charge, grid target stays at base.
+    mgr = make_manager({"import_power_cap_w": 7500},
+                       {"sensor.grid": _grid_state(0)}, [_bat(soc=61.0)])
+    mgr.hass.data.setdefault(DOMAIN, {})["mgr_entry_arb"] = _fake_arb(
+        target_soc=60.0, grid_charge_now_wh=1875.0)
+    result = _tick(mgr)
+    assert result["arb_charging"] is False
+    assert result["target_grid_w"] == -50                   # back to zero-grid base
+
+
+def test_arbitrage_charge_ignored_when_switch_off():
+    # advisory present but switch OFF -> never actuate (grid target stays base).
+    mgr = make_manager({"import_power_cap_w": 7500},
+                       {"sensor.grid": _grid_state(0)}, [_bat(soc=30.0)])
+    mgr.hass.data.setdefault(DOMAIN, {})["mgr_entry_arb"] = _fake_arb(
+        enabled=False, target_soc=60.0, grid_charge_now_wh=1875.0)
+    result = _tick(mgr)
+    assert result["arb_charging"] is False
+    assert result["target_grid_w"] == -50
+
+
+def test_arbitrage_charge_ignored_when_no_advisory():
+    # switch on but planner isn't recommending a buy this bucket -> no actuation.
+    mgr = make_manager({"import_power_cap_w": 7500},
+                       {"sensor.grid": _grid_state(0)}, [_bat(soc=30.0)])
+    mgr.hass.data.setdefault(DOMAIN, {})["mgr_entry_arb"] = _fake_arb(
+        target_soc=30.0, grid_charge_now_wh=0.0)
+    result = _tick(mgr)
+    assert result["arb_charging"] is False
+    assert result["target_grid_w"] == -50
+
+
+def test_arbitrage_charge_never_imports_on_stale_grid():
+    # SAFE must win over grid-charge: no grid sensor -> release, never import blind.
+    mgr = make_manager({"import_power_cap_w": 7500}, {}, [_bat(soc=30.0)])
+    mgr.hass.data.setdefault(DOMAIN, {})["mgr_entry_arb"] = _fake_arb(
+        target_soc=60.0, grid_charge_now_wh=1875.0)
+    result = _tick(mgr)
+    assert result["state"] == "safe"
+    assert mgr.bridge.sent == []          # never dispatched a charge blind
+
+
 def test_tick_error_reports_error_state():
     mgr = make_manager(None, {"sensor.grid": _grid_state(500)}, [_bat()])
     mgr.bridge.read_all = MagicMock(side_effect=RuntimeError("boom"))

@@ -88,9 +88,13 @@ DEFAULT_EXPORT_PRICE: Final[float] = 0.07        # feed-in tariff EUR/kWh (oppor
 # Per-battery cost/cycles are configurable; these seed the fleet default.
 DEFAULT_BATTERY_COST_EUR: Final[float] = 1000.0
 DEFAULT_EXPECTED_CYCLES: Final[int] = 6000
-# Round-trip efficiency: SEED for the self-measuring estimator (measured ~78% in
-# the June regime; sharpens once real high-power discharge data arrives).
-DEFAULT_ETA_SEED: Final[float] = 0.78
+# Round-trip efficiency: SEED for the self-measuring estimator. Independent
+# hands-on measurements of the Venus E 3.0 (metered, incl. dual AC conversion +
+# standby) put real-world RTE at ~80-84%; we seed at the conservative 0.80. The
+# 78% June figure was measured at trickle only, so it flattered the charge leg.
+# Override per-install via the eta_override option; sharpens once real
+# high-power discharge data + the DB estimator are wired.
+DEFAULT_ETA_SEED: Final[float] = 0.80
 ETA_MIN_DSOC: Final[float] = 8.0                 # min SOC swing for a usable η segment
 DEFAULT_MIN_ARBITRAGE_MARGIN_CT: Final[float] = 1.5   # skip sub-margin churn
 ARBITRAGE_HORIZON_H: Final[float] = 36.0         # cap the planning horizon

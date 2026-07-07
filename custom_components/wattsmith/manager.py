@@ -39,6 +39,7 @@ from .const import (
     CONF_GOE_IP,
     CONF_GRID_SENSOR,
     CONF_HOUSE_CONSUMPTION_SENSOR,
+    CONF_IMPORT_POWER_CAP_W,
     CONF_KD,
     CONF_KP,
     CONF_MAX_BATTERY_SOC,
@@ -119,6 +120,8 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         self._last_baseline_save: float = 0.0    # monotonic; save at most hourly
         # Latest adaptive decision (published for the Adaptive entities).
         self._adaptive: AdaptiveResult | None = None
+        # True while actively grid-charging for arbitrage (published on status).
+        self._arb_charging: bool = False
 
         self.controller = ZeroGridController(self._build_controller_config())
         self.supervisor = SafetySupervisor(
@@ -239,6 +242,41 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         """Arbitrage discharge-hold floor (only when the Arbitrage switch is on)."""
         arb = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_arb")
         return getattr(arb, "hold_floor_soc", None)
+
+    def _arb_charge_target_soc(self) -> float | None:
+        """Grid-charge target SOC for THIS bucket, or None.
+
+        Returns a target only when the Arbitrage switch is on AND the planner is
+        actively recommending a grid-charge this bucket (grid_charge_now_wh > 0).
+        The manager actuates it by driving the grid target to a positive import
+        setpoint (see the tick); the discharge-hold then protects what we buy.
+        """
+        arb = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_arb")
+        if arb is None or not getattr(arb, "enabled", False):
+            return None
+        data = getattr(arb, "data", None) or {}
+        charge_wh = data.get("grid_charge_now_wh") or 0.0
+        target = getattr(arb, "charge_floor_soc", None)
+        return target if (charge_wh > 0 and target is not None) else None
+
+    def _import_cap_w(self) -> int:
+        """Grid-import ceiling while grid-charging. 0/blank -> full fleet charge power."""
+        raw = self._opt(CONF_IMPORT_POWER_CAP_W, 0)
+        cap = int(float(raw)) if raw not in (None, "") else 0
+        if cap > 0:
+            return cap
+        n = len(self.bridge.device_ids()) or 1
+        return n * DEFAULT_MAX_BATTERY_POWER
+
+    @staticmethod
+    def _fleet_soc(states) -> float | None:
+        """Capacity-weighted mean SOC of the readable fleet, or None."""
+        socs = [(s.soc, s.capacity) for s in states
+                if s.soc is not None and s.capacity]
+        if not socs:
+            return None
+        cap = sum(c for _s, c in socs)
+        return sum(s * c for s, c in socs) / cap if cap > 0 else None
 
     # ---- adaptive PV charging ------------------------------------------
 
@@ -493,6 +531,30 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
                 self.planner.config.max_battery_soc = min(
                     self.planner.config.max_battery_soc, ev_reserve
                 )
+            # Arbitrage grid-charge ACTUATION (Phase 4, gated by the Arbitrage switch):
+            # when the planner wants to buy this bucket and the fleet is still below
+            # the earmarked target, flip the grid target to a positive import setpoint
+            # and cap charging at the target SOC. The zero-grid PD loop then drives the
+            # fleet to import up to the cap; its own charge-cap clamp forbids any
+            # discharge-to-chase once full, and a stale grid still trips SAFE (never
+            # imports blind). Otherwise the grid target stays at its configured base.
+            charge_target = self._arb_charge_target_soc()
+            fleet_soc = self._fleet_soc(states)
+            charging = (
+                charge_target is not None
+                and fleet_soc is not None
+                and fleet_soc < charge_target - 0.5
+            )
+            if charging:
+                self.controller.config.target_grid_w = self._import_cap_w()
+                self.planner.config.max_battery_soc = min(
+                    self.planner.config.max_battery_soc, charge_target
+                )
+            else:
+                self.controller.config.target_grid_w = int(
+                    self._opt(CONF_TARGET_GRID_W, DEFAULT_TARGET_GRID_W)
+                )
+            self._arb_charging = charging
             grid, fresh, key = self._read_grid()
             bridge = self._ev_bridging()
             obs = Observation(
@@ -534,6 +596,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             "command_total": plan.command_total,
             "setpoints": plan.setpoints,
             "stalled_ids": plan.stalled_ids,
+            "arb_charging": self._arb_charging,
             "safety": self.supervisor.status(now),
             "target_grid_w": self.controller.config.target_grid_w,
             "adaptive": self._adaptive_status(),
@@ -545,7 +608,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             "state": "error", "reason": err, "enabled": self.enabled,
             "grid_power": None, "ev_power": 0.0, "effective_grid": None,
             "command_total": 0, "setpoints": {},
-            "stalled_ids": [],
+            "stalled_ids": [], "arb_charging": False,
             "safety": self.supervisor.status(now),
             "target_grid_w": self.controller.config.target_grid_w,
             "adaptive": self._adaptive_status(),

@@ -125,6 +125,8 @@ class ManagerSensor(CoordinatorEntity, SensorEntity):
             "config_warnings": data.get("config_warnings", []),
             # batteries excluded from discharge due to the anti-windup stall detector
             "stalled_batteries": data.get("stalled_ids", []),
+            # True while actively importing from the grid to charge for arbitrage
+            "arbitrage_charging": data.get("arb_charging", False),
         }
 
 
