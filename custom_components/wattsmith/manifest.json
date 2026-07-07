@@ -1,7 +1,7 @@
 {
   "domain": "wattsmith",
   "name": "Wattsmith",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "codeowners": [
     "@aboutandre"
   ],
