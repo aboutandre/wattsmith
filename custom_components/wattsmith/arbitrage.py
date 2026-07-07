@@ -140,6 +140,10 @@ class Econ:
     wear_ct: float
     min_margin_ct: float
     import_cap_w: float = 0.0   # 0 = no cap
+    # Pad the forecast deficit before trusting held energy to cover it — the load/PV
+    # forecast can miss (e.g. a below-baseline night), and "already hold enough" with
+    # zero margin means a miss drains the fleet with no buffer left.
+    forecast_margin_frac: float = 0.15
 
 
 @dataclass(frozen=True)
@@ -196,8 +200,10 @@ def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> Arbi
     cheaper_ahead = any(
         buckets[j].price_ct < charge_price - 1e-9 for j in range(1, earliest)
     )
-    # 4. discharge hold: protect earmarked energy for the upcoming deficits
-    hold_e = min(usable_now, profitable_wh)
+    # 4. discharge hold: protect earmarked energy for the upcoming deficits, padded
+    #    against forecast error (a below-baseline miss shouldn't leave zero buffer)
+    padded_wh = profitable_wh * (1.0 + econ.forecast_margin_frac)
+    hold_e = min(usable_now, padded_wh)
     hold_floor_soc = bat.min_soc + 100.0 * hold_e / cap
 
     if cheaper_ahead:
@@ -207,13 +213,14 @@ def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> Arbi
         )
 
     # 5. how much to grid-charge now (bounded by headroom, power/cap, and need)
-    need = max(0.0, profitable_wh - usable_now)
+    need = max(0.0, padded_wh - usable_now)
     grid_now = min(headroom_now, per_bucket_charge, need)
     target_soc = bat.soc_pct + 100.0 * grid_now / cap
     if grid_now < 1.0:
         return ArbitragePlan(
             0.0, bat.soc_pct, hold_floor_soc, profitable_wh,
-            f"already hold enough ({usable_now:.0f} Wh) for {profitable_wh:.0f} Wh of deficits",
+            f"already hold enough ({usable_now:.0f} Wh) for {profitable_wh:.0f} Wh of deficits "
+            f"(+{econ.forecast_margin_frac * 100:.0f}% margin)",
         )
     return ArbitragePlan(
         grid_now, target_soc, hold_floor_soc, profitable_wh,

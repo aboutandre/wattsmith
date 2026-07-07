@@ -119,6 +119,52 @@ def test_all_at_min_soc_commands_zero_discharge():
     assert pl.command_total == 0
 
 
+# ---- discharge anti-windup (stalled battery) ---------------------------
+def test_stalled_fleet_excluded_and_command_drops_to_zero():
+    # all 3 near the floor, commanded hard, but none actually deliver (real hardware
+    # floor above the configured min_soc) -> after stall_ticks the whole fleet is
+    # excluded from discharge instead of winding the command up at max forever.
+    p = make(min_soc=9.0)
+    bb = [BatteryReading(f"b{i}", soc=13.0, power=0) for i in range(3)]
+    for i in range(4):
+        pl = p.plan(ob(i, 3000, key=f"k{i}", batteries=bb))
+    assert set(pl.stalled_ids) == {"b0", "b1", "b2"}
+    assert pl.command_total == 0
+    assert all(v == 0 for v in pl.setpoints.values())
+
+
+def test_only_non_delivering_battery_is_excluded():
+    # b0 never actually delivers despite being commanded; b1/b2 deliver what's asked
+    # of them -> only b0 gets excluded, the healthy pair keeps discharging.
+    p = make(min_soc=9.0)
+    for i in range(4):
+        prev = p._last_setpoints
+        bb = [
+            BatteryReading("b0", soc=13.0, power=0),
+            BatteryReading("b1", soc=13.0, power=prev.get("b1", 0)),
+            BatteryReading("b2", soc=13.0, power=prev.get("b2", 0)),
+        ]
+        pl = p.plan(ob(i, 3000, key=f"k{i}", batteries=bb))
+    assert pl.stalled_ids == ["b0"]
+    assert pl.setpoints.get("b0", 0) == 0
+    assert pl.setpoints.get("b1", 0) > 0
+    assert pl.setpoints.get("b2", 0) > 0
+
+
+def test_stall_clears_once_charged_back_out_of_near_floor_band():
+    p = make(min_soc=9.0, stall_soc_margin=5.0)
+    bb = [BatteryReading(f"b{i}", soc=13.0, power=0) for i in range(3)]
+    for i in range(4):
+        pl = p.plan(ob(i, 3000, key=f"k{i}", batteries=bb))
+    assert set(pl.stalled_ids) == {"b0", "b1", "b2"}
+
+    # recovered well above the near-floor band (min_soc 9 + margin 5 = 14) -> re-eligible
+    recovered = [BatteryReading(f"b{i}", soc=25.0, power=0) for i in range(3)]
+    pl = p.plan(ob(10, 3000, key="k-recover", batteries=recovered))
+    assert pl.stalled_ids == []
+    assert pl.command_total > 0
+
+
 # ---- normal dispatch + dedup + throttle -------------------------------
 def test_normal_dispatch_sends():
     pl = make().plan(ob(100, 500))

@@ -123,6 +123,8 @@ class ManagerSensor(CoordinatorEntity, SensorEntity):
             "safety": data.get("safety"),
             # cross-value config sanity findings (F-17) — empty list = all clear
             "config_warnings": data.get("config_warnings", []),
+            # batteries excluded from discharge due to the anti-windup stall detector
+            "stalled_batteries": data.get("stalled_ids", []),
         }
 
 

@@ -59,6 +59,7 @@ class Plan:
     ev_power: float
     command_total: int
     healthy_ids: list[str]
+    stalled_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -71,6 +72,13 @@ class PlannerConfig:
     max_battery_soc: float = 100.0   # stop charging above this SOC (per-battery)
     max_battery_power: int = 2500
     safe_recover_cycles: int = 3     # consecutive healthy ticks in SAFE before resuming
+    # Discharge anti-windup: a battery near its configured floor that's commanded to
+    # discharge but isn't actually delivering (BMS/hardware cutoff above min_soc) gets
+    # excluded from further discharge instead of the command winding up at max forever.
+    stall_soc_margin: float = 5.0    # only consider batteries within this many % of min_soc
+    stall_power_w: float = 50.0      # actual power below this counts as "not delivering"
+    stall_cmd_w: float = 200.0       # previous commanded discharge above this counts as "asked"
+    stall_ticks: int = 3             # consecutive stalled ticks before excluding
 
 
 class DispatchPlanner:
@@ -90,6 +98,8 @@ class DispatchPlanner:
         self._last_ev = 0.0
         self._last_ev_ts = -1e9          # "never read" sentinel
         self._safe_recover_streak = 0    # consecutive healthy ticks while parked in SAFE
+        self._stall_streak: dict[str, int] = {}  # id -> consecutive commanded-but-not-delivering ticks
+        self._stalled: dict[str, bool] = {}       # id -> latched "excluded from discharge" state
 
     # ---- EV exclusion (safety-critical) --------------------------------
     def resolve_ev(self, obs: Observation) -> float | None:
@@ -132,12 +142,37 @@ class DispatchPlanner:
 
         # 3) Battery health + healthy set.
         healthy: list[BatteryState] = []
+        stalled_ids: list[str] = []
         for b in obs.batteries:
             self.supervisor.record_battery(b.id, b.read_ok)
             if b.read_ok and b.soc is not None and self.supervisor.battery_healthy(b.id):
+                soc = float(b.soc)
+                # Anti-windup: near the floor, commanded to discharge, but not actually
+                # delivering for several ticks running -> latch as stalled at its real
+                # (hardware) floor instead of letting the PD loop keep demanding max power.
+                # Latched (not just streak-reset) so it doesn't immediately re-qualify the
+                # instant the command drops to 0 — it stays excluded until it's charged
+                # back out of the near-floor band, proving it can take/give real power again.
+                near_floor = soc <= cfg.min_soc + cfg.stall_soc_margin
+                stalled = self._stalled.get(b.id, False)
+                if stalled and not near_floor:
+                    stalled = False
+                    self._stall_streak[b.id] = 0
+                elif not stalled:
+                    prev_cmd = self._last_setpoints.get(b.id, 0)
+                    stalled_this_tick = (
+                        near_floor and prev_cmd > cfg.stall_cmd_w and b.power < cfg.stall_power_w
+                    )
+                    streak = self._stall_streak.get(b.id, 0) + 1 if stalled_this_tick else 0
+                    self._stall_streak[b.id] = streak
+                    stalled = streak >= cfg.stall_ticks
+                self._stalled[b.id] = stalled
+                if stalled:
+                    stalled_ids.append(b.id)
                 healthy.append(BatteryState(
-                    id=b.id, soc=float(b.soc), power=int(b.power),
-                    min_soc=cfg.min_soc, max_soc=cfg.max_battery_soc,
+                    id=b.id, soc=soc, power=int(b.power),
+                    min_soc=max(cfg.min_soc, soc) if stalled else cfg.min_soc,
+                    max_soc=cfg.max_battery_soc,
                     max_power=cfg.max_battery_power,
                 ))
         healthy_ids = [b.id for b in healthy]
@@ -161,7 +196,7 @@ class DispatchPlanner:
                       if not self.supervisor.grid_fresh(obs.now)
                       else "repeated control-cycle failures (recovering)")
             return self._mk("release", {}, "safe", reason, obs.grid_value, ev or 0.0,
-                            healthy_ids)
+                            healthy_ids, stalled_ids)
         self._safe_recover_streak = 0
 
         # 5) Can't dispatch safely this tick -> HOLD (setpoints persist via cd_time).
@@ -177,7 +212,7 @@ class DispatchPlanner:
         if hold_reasons:
             self.supervisor.record_cycle(ok=False)
             return self._mk("hold", {}, "hold", ", ".join(hold_reasons),
-                            obs.grid_value, ev or 0.0, healthy_ids)
+                            obs.grid_value, ev or 0.0, healthy_ids, stalled_ids)
 
         # 6) Dispatch. Recompute only on a NEW grid sample (avoid double-counting a
         #    repeated reading -> overshoot). Otherwise reuse the held setpoints.
@@ -194,10 +229,11 @@ class DispatchPlanner:
         if not new_sample and (obs.now - self._last_send_ts) < cfg.resend_s:
             self.supervisor.record_cycle(ok=True)
             return self._mk("hold", setpoints, "normal", "holding (cd_time still armed)",
-                            obs.grid_value, ev, healthy_ids)
+                            obs.grid_value, ev, healthy_ids, stalled_ids)
 
         self._last_send_ts = obs.now
-        return self._mk("send", setpoints, "normal", "", obs.grid_value, ev, healthy_ids)
+        return self._mk("send", setpoints, "normal", "", obs.grid_value, ev, healthy_ids,
+                        stalled_ids)
 
     def record_send(self, now: float, results: dict[str, bool]) -> tuple[str, str]:
         """Fold in per-battery send results ({id: acked}). Returns (state, reason).
@@ -218,7 +254,8 @@ class DispatchPlanner:
         return "normal", ""
 
     # ---- helper --------------------------------------------------------
-    def _mk(self, action, setpoints, state, reason, grid, ev, healthy_ids=None) -> Plan:
+    def _mk(self, action, setpoints, state, reason, grid, ev, healthy_ids=None,
+            stalled_ids=None) -> Plan:
         return Plan(
             action=action,
             setpoints=setpoints,
@@ -228,4 +265,5 @@ class DispatchPlanner:
             ev_power=ev,
             command_total=sum(setpoints.values()),
             healthy_ids=healthy_ids or [],
+            stalled_ids=stalled_ids or [],
         )

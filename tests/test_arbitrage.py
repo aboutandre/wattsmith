@@ -104,6 +104,35 @@ def test_hold_floor_protects_earmarked_energy():
     assert plan.hold_floor_soc > charged.min_soc
 
 
+def test_forecast_margin_tops_up_even_when_raw_deficit_exactly_covered():
+    # usable_now (1382.4 Wh) exactly matches the raw forecast deficit -> with zero
+    # margin that reads as "already hold enough"; the default margin (15%) should
+    # still top up, since a forecast that's exactly right leaves no buffer for a miss.
+    buckets = [Bucket(12, 0, 0), Bucket(35, 0, 2764.8)]
+    plan = plan_arbitrage(buckets, BAT, ECON)
+    assert abs(plan.profitable_deficit_wh - 1382.4) < 1.0
+    assert plan.grid_charge_now_wh > 0
+
+    zero_margin = Econ(eta=0.78, wear_ct=3.26, min_margin_ct=1.5, forecast_margin_frac=0.0)
+    plan0 = plan_arbitrage(buckets, BAT, zero_margin)
+    assert plan0.grid_charge_now_wh == 0.0
+    assert "already hold enough" in plan0.reason
+
+
+def test_forecast_margin_raises_hold_floor():
+    charged = BatteryModel(soc_pct=60.0, capacity_wh=15360.0, min_soc=11.0,
+                           max_soc=80.0, charge_power_w=7500.0)
+    buckets = _flat([12] + [35] * 6, load=2000.0)
+    padded = plan_arbitrage(buckets, charged, ECON)  # default 15% margin
+
+    zero_margin = Econ(eta=0.78, wear_ct=3.26, min_margin_ct=1.5, forecast_margin_frac=0.0)
+    unpadded = plan_arbitrage(buckets, charged, zero_margin)
+
+    assert padded.hold_floor_soc > unpadded.hold_floor_soc
+    # padding only affects the reservation, not the reported raw forecast deficit
+    assert padded.profitable_deficit_wh == unpadded.profitable_deficit_wh
+
+
 def test_build_buckets_aligns_and_bounds_horizon():
     now = 900.0  # bucket-aligned
     prices = [(0.0, 0.10), (3600.0, 0.30)]   # hour 0 = 10 ct, hour 1 = 30 ct
