@@ -154,12 +154,18 @@ class EvCoordinator(DataUpdateCoordinator):
 
     @property
     def solar_reserve_soc(self) -> float | None:
-        """The reserve SOC while the EV is actively solar-charging, else None.
+        """The reserve SOC while the EV is actually drawing solar charge, else None.
 
         The manager caps battery charging at this value so the car has
-        right-of-way for the PV surplus while in 'solar' state.
+        right-of-way for the PV surplus while in 'solar' state. Gated on
+        confirmed charger power (not just the planner's intended state): a
+        'solar' plan that never lands real current (car not accepting it,
+        wallbox drift, etc.) must not lock the batteries out of the adaptive
+        ceiling for a charge that isn't actually happening.
         """
         if not self.data or self.data.get("state") != "solar":
+            return None
+        if (self.data.get("ev_power_w") or 0.0) <= _CAR_CHARGING_W:
             return None
         return self._planner.config.reserve_soc
 
