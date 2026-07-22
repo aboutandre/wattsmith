@@ -263,13 +263,26 @@ def test_car_label_published_in_tick():
 
 
 def test_solar_reserve_surface_for_manager():
-    driver = FakeDriver([WallboxState(force=FORCE_OFF, amp=6, phases=1,
-                                      power_w=0.0, connected=True, done=False)])
+    # real current flowing (1500 W > the 100 W charging threshold) → override active
+    driver = FakeDriver([WallboxState(force=FORCE_ON, amp=6, phases=1,
+                                      power_w=1500.0, connected=True, done=False)])
     coord = make_coord(BASE_OPTIONS, {"sensor.grid": -5060.0}, [_bat(soc=90.0, power=0)], driver)
     coord.data = _tick(coord)
     assert coord.data["state"] == "solar"
     assert coord.solar_reserve_soc == coord._planner.config.reserve_soc
     coord.data = {"state": "waiting"}
+    assert coord.solar_reserve_soc is None
+
+
+def test_solar_reserve_not_surfaced_without_real_power():
+    # planner WANTS to solar-charge (state == "solar") but the wallbox hasn't
+    # actually delivered any current yet (car not accepting it, drift, etc.) —
+    # must not lock the batteries out of the adaptive ceiling for a phantom charge
+    driver = FakeDriver([WallboxState(force=FORCE_OFF, amp=6, phases=1,
+                                      power_w=0.0, connected=True, done=False)])
+    coord = make_coord(BASE_OPTIONS, {"sensor.grid": -5060.0}, [_bat(soc=90.0, power=0)], driver)
+    coord.data = _tick(coord)
+    assert coord.data["state"] == "solar"
     assert coord.solar_reserve_soc is None
 
 
