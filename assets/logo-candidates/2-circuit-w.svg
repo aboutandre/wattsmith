@@ -1,0 +1,26 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="1" stop-color="#0b1120"/>
+    </linearGradient>
+    <linearGradient id="trace" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="4" y="4" width="248" height="248" rx="56" fill="url(#bg2)"/>
+  <rect x="4" y="4" width="248" height="248" rx="56" fill="none" stroke="#1e293b" stroke-width="2"/>
+
+  <!-- a "W" drawn as one angular bolt-like trace -->
+  <path d="M50,80 L78,178 L104,110 L128,178 L152,110 L178,178 L206,80"
+        fill="none" stroke="url(#trace)" stroke-width="16"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- circuit node dots at the terminals/peaks -->
+  <circle cx="50" cy="80" r="8" fill="#22d3ee"/>
+  <circle cx="206" cy="80" r="8" fill="#6366f1"/>
+  <circle cx="104" cy="110" r="6" fill="#67e8f9"/>
+  <circle cx="152" cy="110" r="6" fill="#818cf8"/>
+</svg>

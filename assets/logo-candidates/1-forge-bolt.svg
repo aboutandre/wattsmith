@@ -1,0 +1,39 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg1" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a2422"/>
+      <stop offset="1" stop-color="#161211"/>
+    </linearGradient>
+    <linearGradient id="copper" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e08a4b"/>
+      <stop offset="1" stop-color="#b5602a"/>
+    </linearGradient>
+    <linearGradient id="bolt" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffe08a"/>
+      <stop offset="1" stop-color="#f7b733"/>
+    </linearGradient>
+  </defs>
+
+  <circle cx="128" cy="128" r="124" fill="url(#bg1)"/>
+  <circle cx="128" cy="128" r="122" fill="none" stroke="#453a35" stroke-width="3"/>
+
+  <!-- anvil, single silhouette: horn + body + flared base -->
+  <g fill="url(#copper)" stroke="#5c3417" stroke-width="3" stroke-linejoin="round">
+    <polygon points="98,146 190,146 190,188 98,188 42,176 28,154 62,148"/>
+    <polygon points="86,188 178,188 190,210 72,210"/>
+  </g>
+  <!-- top-face highlight -->
+  <rect x="98" y="146" width="92" height="8" rx="2" fill="#f3b87c" opacity="0.65"/>
+
+  <!-- spark impact glow -->
+  <circle cx="158" cy="120" r="30" fill="#ffdf8a" opacity="0.20"/>
+
+  <!-- bolt striking the anvil's top-right corner -->
+  <polygon points="196,30 146,112 170,112 138,178 210,100 180,100"
+           fill="url(#bolt)" stroke="#7a4a12" stroke-width="3" stroke-linejoin="round"/>
+
+  <!-- small sparks -->
+  <circle cx="192" cy="140" r="4" fill="#ffe08a"/>
+  <circle cx="206" cy="124" r="3" fill="#ffe08a"/>
+  <circle cx="176" cy="150" r="3" fill="#ffe08a"/>
+</svg>

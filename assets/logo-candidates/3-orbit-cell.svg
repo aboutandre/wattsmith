@@ -1,0 +1,30 @@
+<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg3" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#060a12"/>
+    </linearGradient>
+    <linearGradient id="cell" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#34d399"/>
+      <stop offset="1" stop-color="#059669"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="256" height="256" rx="60" fill="url(#bg3)"/>
+
+  <!-- orbit rings: amber = solar in, blue = grid tie -->
+  <path d="M 112,218.6 A 92,92 0 0 1 112,37.4" fill="none" stroke="#f59e0b" stroke-width="12" stroke-linecap="round"/>
+  <path d="M 144,37.4 A 92,92 0 0 1 144,218.6" fill="none" stroke="#3b82f6" stroke-width="12" stroke-linecap="round"/>
+
+  <!-- sun terminal -->
+  <circle cx="112" cy="37.4" r="9" fill="#fbbf24"/>
+  <!-- grid terminal -->
+  <circle cx="144" cy="218.6" r="9" fill="#60a5fa"/>
+
+  <!-- battery cell, centered -->
+  <rect x="118" y="82" width="20" height="10" rx="3" fill="#a7f3d0"/>
+  <rect x="104" y="92" width="48" height="76" rx="10" fill="url(#cell)" stroke="#065f46" stroke-width="3"/>
+
+  <!-- bolt cutout -->
+  <polygon points="134,104 116,140 128,140 122,160 146,122 132,122" fill="#ecfdf5"/>
+</svg>
