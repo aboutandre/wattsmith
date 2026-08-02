@@ -68,6 +68,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception as err:  # noqa: BLE001 - logging must never block setup
             _LOGGER.warning("Wattsmith history DB failed to start: %s", err)
 
+    # query_history service: a read-only window onto the history DB above, so
+    # it's reachable over the plain HA REST API (no filesystem/SSH access to
+    # the HA host needed for long-horizon analysis).
+    from .services import async_setup_services as setup_services
+    await setup_services(hass)
+
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     _LOGGER.debug("Wattsmith entry %s set up", entry.entry_id)
     return True

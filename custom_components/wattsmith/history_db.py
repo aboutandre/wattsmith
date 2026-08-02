@@ -130,6 +130,17 @@ CREATE TABLE IF NOT EXISTS config_event (
 CREATE TABLE IF NOT EXISTS meta ( key TEXT PRIMARY KEY, value TEXT );
 """
 
+# Tables the query_history service is allowed to read (fixed allow-list — the
+# table name is interpolated into SQL, so anything outside this set is rejected
+# before it ever reaches sqlite).
+QUERY_TABLES = ("bucket", "battery_bucket", "config_snapshot", "config_event")
+_QUERY_TS_COLUMN = {
+    "bucket": "ts_start",
+    "battery_bucket": "ts_start",
+    "config_snapshot": "ts",
+    "config_event": "ts",
+}
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers (no HA / sqlite) — unit tested
@@ -660,6 +671,53 @@ class HistoryRecorder:
             conn.commit()
         finally:
             conn.close()
+
+    # ---- read-only queries (query_history service) -----------------------
+    def query_range(
+        self,
+        start_ts: int,
+        end_ts: int,
+        table: str = "bucket",
+        battery_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Read rows from `table` with a timestamp in [start_ts, end_ts].
+
+        Blocking (sqlite) — call via `async_query_range` from the event loop.
+        `table` is checked against the fixed QUERY_TABLES allow-list before use,
+        so it's safe to interpolate into the SQL string. `battery_id` further
+        filters `battery_bucket` rows when given.
+        """
+        if table not in QUERY_TABLES:
+            raise ValueError(f"unknown table {table!r}; must be one of {QUERY_TABLES}")
+        ts_col = _QUERY_TS_COLUMN[table]
+        conn = self._connect()
+        try:
+            conn.row_factory = sqlite3.Row
+            sql = f"SELECT * FROM {table} WHERE {ts_col} BETWEEN ? AND ?"
+            params: list[Any] = [start_ts, end_ts]
+            if table == "battery_bucket" and battery_id:
+                sql += " AND battery_id = ?"
+                params.append(battery_id)
+            sql += f" ORDER BY {ts_col} LIMIT ?"
+            params.append(int(limit))
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    async def async_query_range(
+        self,
+        start_ts: int,
+        end_ts: int,
+        table: str = "bucket",
+        battery_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Event-loop-safe wrapper around `query_range` (runs on the executor)."""
+        return await self.hass.async_add_executor_job(
+            lambda: self.query_range(start_ts, end_ts, table, battery_id, limit)
+        )
 
     def _checkpoint(self) -> None:
         try:
