@@ -1,0 +1,48 @@
+query_history:
+  name: Query History
+  description: >-
+    Read a time range out of the never-purged 15-minute history DB (separate
+    from HA's own recorder, which purges after ~10 days). Returns rows as a
+    service response — call with return_response to get the data back.
+  fields:
+    start:
+      name: Start
+      description: Start of the range (inclusive).
+      required: true
+      selector:
+        datetime:
+    end:
+      name: End
+      description: End of the range (inclusive).
+      required: true
+      selector:
+        datetime:
+    table:
+      name: Table
+      description: Which table to read from.
+      required: false
+      default: bucket
+      selector:
+        select:
+          options:
+            - bucket
+            - battery_bucket
+            - config_snapshot
+            - config_event
+    battery_id:
+      name: Battery ID
+      description: Only for the battery_bucket table — filter to a single battery.
+      required: false
+      selector:
+        text:
+    limit:
+      name: Limit
+      description: Maximum rows to return.
+      required: false
+      default: 1000
+      selector:
+        number:
+          min: 1
+          max: 5000
+          step: 1
+          mode: box

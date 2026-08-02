@@ -49,6 +49,7 @@ Sample = h.Sample
 BucketAccumulator = h.BucketAccumulator
 BatteryAccum = h.BatteryAccum
 HistoryRecorder = h.HistoryRecorder
+QUERY_TABLES = h.QUERY_TABLES
 
 
 # ── pure helpers ─────────────────────────────────────────────────────────────
@@ -201,6 +202,62 @@ def test_retention_purges_old_rows():
         rec._write_bucket(old.bucket_row(1), old.battery_rows())
         n = sqlite3.connect(tmp).execute("SELECT COUNT(*) FROM bucket").fetchone()[0]
         assert n == 0     # older than retention -> purged on write
+
+
+def test_query_range_filters_ts_window_and_orders():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = os.path.join(d, "history.db")
+        rec = _recorder(tmp)
+        rec._init_db()
+        for ts in (0, 900, 1800, 2700):
+            a = BucketAccumulator(ts_start=ts)
+            a.add(Sample(pv_w=100, fleet_soc=50.0), 900.0)
+            rec._write_bucket(a.bucket_row(1), a.battery_rows())
+        rows = rec.query_range(900, 1800, table="bucket")
+        assert [r["ts_start"] for r in rows] == [900, 1800]
+
+
+def test_query_range_limit():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = os.path.join(d, "history.db")
+        rec = _recorder(tmp)
+        rec._init_db()
+        for ts in (0, 900, 1800, 2700):
+            a = BucketAccumulator(ts_start=ts)
+            a.add(Sample(pv_w=100, fleet_soc=50.0), 900.0)
+            rec._write_bucket(a.bucket_row(1), a.battery_rows())
+        rows = rec.query_range(0, 2700, table="bucket", limit=2)
+        assert [r["ts_start"] for r in rows] == [0, 900]
+
+
+def test_query_range_battery_bucket_filters_by_battery_id():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = os.path.join(d, "history.db")
+        rec = _recorder(tmp)
+        rec._init_db()
+        a = BucketAccumulator(ts_start=900)
+        a.add(Sample(batteries={"f9": (100.0, 60.0, 24.0), "f10": (200.0, 55.0, 25.0)}), 900.0)
+        rec._write_bucket(a.bucket_row(1), a.battery_rows())
+        rows = rec.query_range(900, 900, table="battery_bucket", battery_id="f10")
+        assert len(rows) == 1
+        assert rows[0]["battery_id"] == "f10"
+
+
+def test_query_range_rejects_unknown_table():
+    with tempfile.TemporaryDirectory() as d:
+        rec = _recorder(os.path.join(d, "history.db"))
+        rec._init_db()
+        try:
+            rec.query_range(0, 1, table="sqlite_master")
+            raised = False
+        except ValueError:
+            raised = True
+        assert raised
+
+
+def test_query_tables_matches_schema():
+    # every allowed table must actually exist in the schema
+    assert set(QUERY_TABLES) == {"bucket", "battery_bucket", "config_snapshot", "config_event"}
 
 
 if __name__ == "__main__":
