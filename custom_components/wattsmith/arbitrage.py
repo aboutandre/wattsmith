@@ -195,10 +195,52 @@ class ArbitragePlan:
     hold_floor_soc: float       # don't discharge below this (protect earmark)
     profitable_deficit_wh: float
     reason: str
+    # The explicit answer to "when would we need to buy, and at what price?" —
+    # recorded so the dashboard and history DB show WHY, not just how much.
+    next_need_idx: int | None = None
+    next_need_price_ct: float | None = None
+    buy_idx: int | None = None
+    buy_price_ct: float | None = None
 
 
 def _idle(bat: BatteryModel, reason: str) -> ArbitragePlan:
     return ArbitragePlan(0.0, bat.soc_pct, bat.min_soc, 0.0, reason)
+
+
+def _forward_sim(
+    buckets: list[Bucket], usable_now: float, cap_usable: float,
+    pv_charge_limit_wh: float, discharge_limit_wh: float,
+) -> tuple[list[tuple[int, float, float]], list[float]]:
+    """PV-first walk: what the fleet does with no grid purchases at all.
+
+    Returns (deficits, trace) where deficits is [(idx, price_ct, wh)] for every
+    bucket PV+battery cannot cover, and trace[i] is the usable energy held at the
+    START of bucket i — which says whether a purchase can physically be carried
+    from a buy bucket through to the deficit it serves.
+
+    NOTE (open question, hel-129): `deficits` is the residue AFTER the battery
+    discharges, so a well-stocked fleet reports none and the discharge hold sized
+    from it collapses to the floor exactly when there is most worth protecting.
+    Sizing the hold on what the battery is scheduled to DELIVER instead was tried
+    and measured WORSE across the 30 synthetic + 8 historical scenarios (+0.36%
+    vs +0.26% regret), so it is deliberately not done. Revisit with real winter data.
+    """
+    soc_e = usable_now
+    deficits: list[tuple[int, float, float]] = []
+    trace: list[float] = []
+    for i, b in enumerate(buckets):
+        trace.append(soc_e)
+        net = b.load_wh - b.pv_wh
+        if net < 0:
+            # PV surplus charges the fleet. Bounded by the battery's own charge
+            # power only — an import cap limits GRID purchases, not sunshine.
+            soc_e = min(cap_usable, soc_e + min(-net, pv_charge_limit_wh))
+        else:
+            take = min(net, soc_e, discharge_limit_wh)
+            soc_e -= take
+            if net - take > 1.0:
+                deficits.append((i, b.price_ct, net - take))
+    return deficits, trace
 
 
 def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> ArbitragePlan:
@@ -213,59 +255,92 @@ def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> Arbi
     if econ.import_cap_w > 0:
         per_bucket_charge = min(per_bucket_charge, econ.import_cap_w * BUCKET_H)
 
-    # 1. PV-first forward sim (no grid arbitrage) -> residual deficits PV+battery can't cover
-    soc_e = usable_now
-    unmet: list[tuple[int, float, float]] = []   # (index, price, wh imported)
-    for i, b in enumerate(buckets):
-        net = b.load_wh - b.pv_wh
-        if net < 0:
-            soc_e = min(cap_usable, soc_e + min(-net, per_bucket_charge))
-        else:
-            take = min(net, soc_e, bat.charge_power_w * BUCKET_H)
-            soc_e -= take
-            if net - take > 1.0:
-                unmet.append((i, b.price_ct, net - take))
-
+    # 1. PV-first forward sim -> every moment grid energy will be needed, and the
+    #    usable-energy trajectory that says what a purchase can be carried through.
+    deficits, trace = _forward_sim(
+        buckets, usable_now, cap_usable,
+        pv_charge_limit_wh=bat.charge_power_w * BUCKET_H,
+        discharge_limit_wh=bat.charge_power_w * BUCKET_H,
+    )
     charge_price = buckets[0].price_ct
     eff_now = effective_cost_ct(charge_price, econ.eta, econ.wear_ct)
+    if not deficits:
+        return _idle(bat, "no deficit in the forecast horizon")
 
-    # 2. future deficits worth pre-charging at the current price
-    worth = [(i, p, wh) for (i, p, wh) in unmet
-             if i >= 1 and is_profitable(p, charge_price, econ.eta, econ.wear_ct, econ.min_margin_ct)]
-    profitable_wh = sum(wh for _i, _p, wh in worth)
-    if not worth:
-        return _idle(bat, f"no profitable window (need > {eff_now + econ.min_margin_ct:.1f} ct)")
+    # 2. Merit order: cover the dearest need first, each from the cheapest moment
+    #    that can actually serve it. The alternative to pre-buying is buying AT the
+    #    need, so the gate compares need-price against that buy price through
+    #    eta + wear. Morning and evening are the same case; nothing is special.
+    purchases = [0.0] * len(buckets)
+    pad = 1.0 + econ.forecast_margin_frac
+    matched: list[tuple[int, float, int, float, float]] = []  # need_i, p_need, buy_j, p_buy, wh
+    for i, p_need, wh in sorted(deficits, key=lambda d: -d[1]):
+        remaining = wh * pad
+        # cheapest-first; price-sorted means the first failure ends the search
+        for j in sorted(range(0, i), key=lambda k: buckets[k].price_ct):
+            if remaining <= 1.0:
+                break
+            p_buy = buckets[j].price_ct
+            if not is_profitable(p_need, p_buy, econ.eta, econ.wear_ct, econ.min_margin_ct):
+                break
+            room_power = per_bucket_charge - purchases[j]
+            # Buying at j lifts SOC for every bucket up to the deficit, so the
+            # binding limit is the fullest point on that span, not headroom at j.
+            room_soc = cap_usable - max(trace[j + 1:i + 1] or [trace[j]])
+            take = min(remaining, room_power, room_soc)
+            if take <= 1.0:
+                continue
+            purchases[j] += take
+            for k in range(j + 1, i + 1):
+                trace[k] += take
+            remaining -= take
+            matched.append((i, p_need, j, p_buy, take))
 
-    earliest = min(i for i, _p, _wh in worth)
+    first_need = min((i for i, _p, _j, _pb, _w in matched), default=None)
+    need_price = next((p for i, p, _j, _pb, _w in matched if i == first_need), None)
 
-    # 3. timing: don't charge now if a cheaper window exists before the earliest deficit
-    cheaper_ahead = any(
-        buckets[j].price_ct < charge_price - 1e-9 for j in range(1, earliest)
-    )
-    # 4. discharge hold: protect earmarked energy for the upcoming deficits, padded
-    #    against forecast error (a below-baseline miss shouldn't leave zero buffer)
-    padded_wh = profitable_wh * (1.0 + econ.forecast_margin_frac)
-    hold_e = min(usable_now, padded_wh)
+    # 3. Discharge hold — deliberately UNCHANGED from the live-verified version:
+    #    energy already stored is earmarked for any future deficit that beats the
+    #    cost of replacing it at today's price. This is about not spending cheap
+    #    what will be dear, and is independent of whether BUYING more is worth it.
+    earmark = [(i, p, wh) for (i, p, wh) in deficits
+               if i >= 1 and is_profitable(p, charge_price, econ.eta, econ.wear_ct,
+                                           econ.min_margin_ct)]
+    profitable_wh = sum(wh for _i, _p, wh in earmark)        # raw, unpadded
+    hold_e = min(usable_now, profitable_wh * pad)
     hold_floor_soc = bat.min_soc + 100.0 * hold_e / cap
+    # Below the wear cost, cycling a kWh through the cells costs more than simply
+    # importing it — every Wh discharged now is a Wh of cell life spent to avoid a
+    # cheaper grid purchase. Freeze discharge outright rather than merely earmark.
+    # (Found by the scenario suite: a windy 3 ct night ran the whole house off the
+    # battery and paid 8.7 ct of wear to dodge 3 ct/kWh of grid energy.)
+    if charge_price < econ.wear_ct:
+        hold_floor_soc = 100.0          # a full hold = do not discharge at all
 
-    if cheaper_ahead:
+    if not matched:
+        cheapest = min((b.price_ct for b in buckets), default=charge_price)
         return ArbitragePlan(
             0.0, bat.soc_pct, hold_floor_soc, profitable_wh,
-            f"cheaper window ahead before deficit @ bucket {earliest}; holding {hold_e:.0f} Wh",
+            f"no profitable window (no buy price beats the need; "
+            f"need > {effective_cost_ct(cheapest, econ.eta, econ.wear_ct) + econ.min_margin_ct:.1f} ct)",
         )
 
-    # 5. how much to grid-charge now (bounded by headroom, power/cap, and need)
-    need = max(0.0, padded_wh - usable_now)
-    grid_now = min(headroom_now, per_bucket_charge, need)
+    grid_now = min(purchases[0], headroom_now)
     target_soc = bat.soc_pct + 100.0 * grid_now / cap
+    common = dict(next_need_idx=first_need, next_need_price_ct=need_price)
     if grid_now < 1.0:
+        buy_j = min((j for _i, _p, j, _pb, _w in matched), default=None)
         return ArbitragePlan(
             0.0, bat.soc_pct, hold_floor_soc, profitable_wh,
-            f"already hold enough ({usable_now:.0f} Wh) for {profitable_wh:.0f} Wh of deficits "
-            f"(+{econ.forecast_margin_frac * 100:.0f}% margin)",
+            f"need {profitable_wh:.0f} Wh from bucket {first_need} @ {need_price:.1f} ct; "
+            f"cheapest buy is bucket {buy_j} @ {buckets[buy_j].price_ct:.1f} ct — waiting"
+            if buy_j else f"already hold enough ({usable_now:.0f} Wh)",
+            buy_idx=buy_j, buy_price_ct=buckets[buy_j].price_ct if buy_j is not None else None,
+            **common,
         )
     return ArbitragePlan(
         grid_now, target_soc, hold_floor_soc, profitable_wh,
-        f"grid-charge {grid_now:.0f} Wh @ {charge_price:.1f} ct "
-        f"(eff {eff_now:.1f}) for {profitable_wh:.0f} Wh future deficit",
+        f"grid-charge {grid_now:.0f} Wh @ {charge_price:.1f} ct (eff {eff_now:.1f}) "
+        f"for {profitable_wh:.0f} Wh needed from bucket {first_need} @ {need_price:.1f} ct",
+        buy_idx=0, buy_price_ct=charge_price, **common,
     )

@@ -44,11 +44,14 @@ def _flat(prices, load=1000.0, pv=0.0):
 
 
 def test_no_deficit_no_charge():
-    # PV covers load every bucket -> nothing to arbitrage
+    # PV covers load every bucket -> nothing to arbitrage. This is now reported
+    # distinctly from "deficits exist but no buy price beats them", which the old
+    # single "no profitable window" string collapsed together (6106 of 7571 live
+    # buckets carried it, hiding which case was actually occurring).
     buckets = [Bucket(price_ct=12, pv_wh=2000, load_wh=1000) for _ in range(8)]
     plan = plan_arbitrage(buckets, BAT, ECON)
     assert plan.grid_charge_now_wh == 0.0
-    assert "no profitable" in plan.reason
+    assert "no deficit" in plan.reason
 
 
 def test_big_future_peak_triggers_charge():
@@ -69,13 +72,69 @@ def test_moderate_peak_not_profitable():
     assert "no profitable" in plan.reason
 
 
-def test_defers_when_cheaper_window_ahead():
-    # cheaper window (8 ct) sits before the 35-ct deficit -> wait, don't charge now
+def test_defers_when_a_cheaper_window_can_cover_the_whole_need():
+    # An 8-ct bucket sits before a 35-ct deficit small enough for one charge
+    # bucket to cover -> wait for it and name it, don't buy at 12 ct now.
+    buckets = [Bucket(12, 0, 500), Bucket(8, 0, 500), Bucket(35, 0, 1200)]
+    plan = plan_arbitrage(buckets, BAT, ECON)
+    assert plan.grid_charge_now_wh == 0.0
+    assert plan.buy_idx == 1 and plan.next_need_idx == 2
+    assert "waiting" in plan.reason
+
+
+def test_buys_now_too_when_one_cheap_bucket_cannot_cover_the_need():
+    # Same shape, but the deficit is far bigger than a single 1875 Wh charge
+    # bucket. The 8-ct bucket alone is not enough, and 12 ct still beats 35 ct,
+    # so buying now as well is correct — the old all-or-nothing defer was wrong.
     buckets = [Bucket(12, 0, 2000), Bucket(8, 0, 2000), Bucket(35, 0, 3000),
                Bucket(35, 0, 3000), Bucket(35, 0, 3000)]
     plan = plan_arbitrage(buckets, BAT, ECON)
+    assert plan.grid_charge_now_wh > 0
+    assert plan.next_need_idx == 2 and plan.next_need_price_ct == 35
+
+
+def test_cheap_midday_trough_charges_for_the_night():
+    # André's case: PV is still producing but will not fill the fleet, and a short
+    # cheap window sits at noon. The night deficit must pull from that trough.
+    buckets = ([Bucket(30, 0, 400)]                 # now, dear
+               + [Bucket(14, 1200, 400)] * 4        # the cheap midday trough, PV on
+               + [Bucket(38, 0, 2500)] * 6)         # the night it cannot cover
+    empty = BatteryModel(soc_pct=11.0, capacity_wh=15360.0, min_soc=11.0,
+                         max_soc=100.0, charge_power_w=7500.0)
+    plan = plan_arbitrage(buckets, empty, ECON)
+    assert plan.buy_idx is not None and 1 <= plan.buy_idx <= 4, plan.reason
+    assert plan.next_need_idx >= 5
+    assert plan.grid_charge_now_wh == 0.0        # not now at 30 ct — at the trough
+
+
+def test_dearest_need_wins_the_scarce_cheap_bucket():
+    # One cheap bucket, two competing deficits -> the dearer one is served first.
+    buckets = [Bucket(10, 0, 0), Bucket(30, 0, 2000), Bucket(60, 0, 2000)]
+    empty = BatteryModel(soc_pct=11.0, capacity_wh=15360.0, min_soc=11.0,
+                         max_soc=100.0, charge_power_w=7500.0)
+    plan = plan_arbitrage(buckets, empty, ECON)
+    assert plan.next_need_price_ct == 60      # the 60-ct need, not the 30-ct one
+
+
+def test_no_match_when_no_buy_price_beats_the_need():
+    # Deficit is real but every buyable bucket is too dear to be worth storing.
+    buckets = [Bucket(30, 0, 0), Bucket(31, 0, 3000), Bucket(31, 0, 3000)]
+    empty = BatteryModel(soc_pct=11.0, capacity_wh=15360.0, min_soc=11.0,
+                         max_soc=100.0, charge_power_w=7500.0)
+    plan = plan_arbitrage(buckets, empty, ECON)
     assert plan.grid_charge_now_wh == 0.0
-    assert "cheaper window ahead" in plan.reason
+    assert "no profitable window" in plan.reason
+
+
+def test_import_cap_does_not_throttle_pv_charging():
+    # An import cap limits GRID purchases, never sunshine: with a big PV surplus
+    # the fleet must still fill from PV and leave no deficit to buy for.
+    buckets = [Bucket(12, 8000, 500)] * 6 + [Bucket(40, 0, 500)] * 4
+    capped = Econ(eta=0.78, wear_ct=3.26, min_margin_ct=1.5, import_cap_w=500.0)
+    low = BatteryModel(soc_pct=12.0, capacity_wh=15360.0, min_soc=11.0,
+                       max_soc=100.0, charge_power_w=7500.0)
+    plan = plan_arbitrage(buckets, low, capped)
+    assert plan.grid_charge_now_wh == 0.0
 
 
 def test_import_cap_limits_charge():
@@ -104,19 +163,21 @@ def test_hold_floor_protects_earmarked_energy():
     assert plan.hold_floor_soc > charged.min_soc
 
 
-def test_forecast_margin_tops_up_even_when_raw_deficit_exactly_covered():
-    # usable_now (1382.4 Wh) exactly matches the raw forecast deficit -> with zero
-    # margin that reads as "already hold enough"; the default margin (15%) should
-    # still top up, since a forecast that's exactly right leaves no buffer for a miss.
+def test_deficit_is_already_net_of_stored_energy_so_it_is_not_subtracted_twice():
+    # REGRESSION. The forward sim reports the deficit REMAINING AFTER the battery
+    # has discharged into it. The old planner then subtracted usable_now from that
+    # deficit a second time, so with 1382.4 Wh stored against a 2764.8 Wh load it
+    # concluded "already hold enough" and bought nothing — importing the shortfall
+    # at 35 ct instead of pre-buying it at 12 ct. It under-bought by exactly the
+    # amount the fleet was holding.
     buckets = [Bucket(12, 0, 0), Bucket(35, 0, 2764.8)]
-    plan = plan_arbitrage(buckets, BAT, ECON)
-    assert abs(plan.profitable_deficit_wh - 1382.4) < 1.0
-    assert plan.grid_charge_now_wh > 0
-
     zero_margin = Econ(eta=0.78, wear_ct=3.26, min_margin_ct=1.5, forecast_margin_frac=0.0)
     plan0 = plan_arbitrage(buckets, BAT, zero_margin)
-    assert plan0.grid_charge_now_wh == 0.0
-    assert "already hold enough" in plan0.reason
+    assert abs(plan0.profitable_deficit_wh - 1382.4) < 1.0   # battery covers the other half
+    assert plan0.grid_charge_now_wh > 1300.0, plan0.reason   # and we buy the rest cheap
+
+    padded = plan_arbitrage(buckets, BAT, ECON)              # 15% margin buys a little more
+    assert padded.grid_charge_now_wh >= plan0.grid_charge_now_wh
 
 
 def test_forecast_margin_raises_hold_floor():
