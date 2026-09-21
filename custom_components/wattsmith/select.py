@@ -1,4 +1,4 @@
-"""Select platform — EV charging mode + cheap-price target."""
+"""Select platform — EV charging mode, cheap-price target, arbitrage PV confidence."""
 from __future__ import annotations
 
 import logging
@@ -9,12 +9,18 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .arbitrage import PV_CONFIDENCE_LEVELS
 from .const import (
+    CONF_ARBITRAGE_PV_CONFIDENCE,
     CONF_CHEAP_TARGET,
     CONF_EV_MODE,
     DOMAIN,
 )
-from .settings import DEFAULT_CHEAP_TARGET, DEFAULT_EV_MODE
+from .settings import (
+    DEFAULT_ARBITRAGE_PV_CONFIDENCE,
+    DEFAULT_CHEAP_TARGET,
+    DEFAULT_EV_MODE,
+)
 from .ev_coordinator import EvCoordinator
 from .ev_planner import TARGET_BATTERY, TARGET_BOTH, TARGET_CAR, TARGET_NONE
 
@@ -26,13 +32,16 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up the EV mode + cheap-target selects."""
+    """Set up the EV mode + cheap-target selects and the arbitrage PV confidence."""
+    entities: list = []
     ev_coord: EvCoordinator | None = hass.data[DOMAIN].get(entry.entry_id + "_ev")
     if ev_coord is not None:
-        async_add_entities([
-            EvModeSelect(ev_coord, entry),
-            CheapTargetSelect(ev_coord, entry),
-        ])
+        entities += [EvModeSelect(ev_coord, entry), CheapTargetSelect(ev_coord, entry)]
+    arb_coord = hass.data[DOMAIN].get(entry.entry_id + "_arb")
+    if arb_coord is not None:
+        entities.append(ArbitragePvConfidenceSelect(arb_coord, entry))
+    if entities:
+        async_add_entities(entities)
 
 
 class EvModeSelect(CoordinatorEntity, SelectEntity):
@@ -102,4 +111,41 @@ class CheapTargetSelect(CoordinatorEntity, SelectEntity):
         new_options = {**self.coordinator.entry.options, CONF_CHEAP_TARGET: option}
         self.hass.config_entries.async_update_entry(self._entry, options=new_options)
         await self.coordinator.async_apply_options()
+        await self.coordinator.async_request_refresh()
+
+
+class ArbitragePvConfidenceSelect(CoordinatorEntity, SelectEntity):
+    """How much of the Solcast spread the arbitrage planner plans against.
+
+    Lives on the manager device (not the EV one) and writes straight to options,
+    so it is tunable from a dashboard card instead of only from the options flow.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:weather-partly-cloudy"
+
+    def __init__(self, coordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_name = "Arbitrage PV Confidence"
+        self._attr_unique_id = f"{entry.entry_id}_arb_pv_confidence"
+        self._attr_options = list(PV_CONFIDENCE_LEVELS)
+        self._entry = entry
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": entry.title,
+            "manufacturer": "Wattsmith",
+            "model": "Energy Brain",
+        }
+
+    @property
+    def current_option(self) -> str:
+        return self._entry.options.get(
+            CONF_ARBITRAGE_PV_CONFIDENCE, DEFAULT_ARBITRAGE_PV_CONFIDENCE
+        )
+
+    async def async_select_option(self, option: str) -> None:
+        new_options = {**self._entry.options, CONF_ARBITRAGE_PV_CONFIDENCE: option}
+        self.hass.config_entries.async_update_entry(self._entry, options=new_options)
+        # The coordinator re-reads options every tick — just refresh so the new
+        # plan (and the dashboard) reflect the change immediately.
         await self.coordinator.async_request_refresh()

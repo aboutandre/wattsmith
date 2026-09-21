@@ -26,8 +26,10 @@ from .arbitrage import BatteryModel, Econ, build_buckets, plan_arbitrage, pv_slo
 from .battery_bridge import BatteryBridge
 from .const import (
     CONF_ARBITRAGE_ENABLED,
+    CONF_ARBITRAGE_PV_CONFIDENCE,
     CONF_BATTERY_CONFIG,
     CONF_ETA_OVERRIDE,
+    CONF_FORECAST_MARGIN_PCT,
     CONF_IMPORT_POWER_CAP_W,
     CONF_MAX_BATTERY_SOC,
     CONF_MIN_ARBITRAGE_MARGIN_CT,
@@ -40,7 +42,9 @@ from .const import (
 from .economics import fleet_wear_cost_ct, wear_cost_ct_per_kwh
 from .settings import (
     ARBITRAGE_HORIZON_H,
+    DEFAULT_ARBITRAGE_PV_CONFIDENCE,
     DEFAULT_BATTERY_COST_EUR,
+    DEFAULT_FORECAST_MARGIN_PCT,
     DEFAULT_ETA_SEED,
     DEFAULT_EXPECTED_CYCLES,
     DEFAULT_MAX_BATTERY_SOC,
@@ -172,7 +176,10 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         if st is None or not st.attributes:
             return {}
         periods = st.attributes.get("detailedForecast") or st.attributes.get("detailedHourly")
-        return pv_slots_from_detailed(periods if isinstance(periods, list) else [])
+        confidence = self.entry.options.get(
+            CONF_ARBITRAGE_PV_CONFIDENCE, DEFAULT_ARBITRAGE_PV_CONFIDENCE)
+        return pv_slots_from_detailed(
+            periods if isinstance(periods, list) else [], confidence)
 
     def _load_by_hour(self) -> list[float] | None:
         mgr = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id)
@@ -198,6 +205,8 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
                 min_margin_ct=float(self.entry.options.get(
                     CONF_MIN_ARBITRAGE_MARGIN_CT, DEFAULT_MIN_ARBITRAGE_MARGIN_CT)),
                 import_cap_w=float(self.entry.options.get(CONF_IMPORT_POWER_CAP_W, 0) or 0),
+                forecast_margin_frac=float(self.entry.options.get(
+                    CONF_FORECAST_MARGIN_PCT, DEFAULT_FORECAST_MARGIN_PCT)) / 100.0,
             )
             prices = await self._prices()
             buckets = build_buckets(

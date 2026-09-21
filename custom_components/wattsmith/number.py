@@ -25,6 +25,7 @@ from .const import (
     CONF_CHEAP_PRICE_THRESHOLD,
     CONF_DEADBAND_W,
     CONF_DIRECTION_HYSTERESIS_W,
+    CONF_FORECAST_MARGIN_PCT,
     CONF_KD,
     CONF_KP,
     CONF_MAX_BATTERY_SOC,
@@ -40,6 +41,7 @@ from .settings import (
     DEFAULT_BRIDGE_FLOOR_SOC,
     DEFAULT_BRIDGE_GRACE_S,
     DEFAULT_CHEAP_PRICE_THRESHOLD,
+    DEFAULT_FORECAST_MARGIN_PCT,
     DEFAULT_MAX_BATTERY_SOC,
     DEFAULT_PHASE_DOWN_W,
     DEFAULT_PHASE_UP_W,
@@ -115,6 +117,12 @@ NUMBERS: tuple[ManagerNumber, ...] = (
                   "mdi:home-lightning-bolt", lambda c: c.adaptive_baseline_w),
     ManagerNumber(CONF_ADAPTIVE_FORECAST_DERATE, "Adaptive Forecast Derate", 0.5, 1.0, 0.05, None,
                   "mdi:cloud-percent", lambda c: c.adaptive_forecast_derate),
+    # Read by the ARBITRAGE coordinator (it re-reads options every tick), but it
+    # belongs on the manager device next to the other tuning knobs.
+    ManagerNumber(CONF_FORECAST_MARGIN_PCT, "Arbitrage Forecast Margin", 0, 100, 5, "%",
+                  "mdi:shield-percent",
+                  lambda c: float(c.entry.options.get(CONF_FORECAST_MARGIN_PCT,
+                                                      DEFAULT_FORECAST_MARGIN_PCT))),
 )
 
 

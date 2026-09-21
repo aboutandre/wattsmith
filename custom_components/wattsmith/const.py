@@ -92,3 +92,5 @@ CONF_WEAR_COST_CT: Final = "wear_cost_ct"              # EUR-cent/kWh delivered;
 CONF_ETA_OVERRIDE: Final = "eta_override"              # manual round-trip η (0-1); blank -> measured
 CONF_MIN_ARBITRAGE_MARGIN_CT: Final = "min_arbitrage_margin_ct"
 CONF_IMPORT_POWER_CAP_W: Final = "import_power_cap_w"   # 0 = no cap
+CONF_ARBITRAGE_PV_CONFIDENCE: Final = "arbitrage_pv_confidence"  # central|blend|pessimistic
+CONF_FORECAST_MARGIN_PCT: Final = "forecast_margin_pct"  # pad on the forecast deficit

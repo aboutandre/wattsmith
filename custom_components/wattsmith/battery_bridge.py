@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util import dt as dt_util
 
 from .const import (
     BASE_BATTERY_MARKER_SENSOR,
@@ -46,6 +47,16 @@ class BatteryHandle:
     soc_entity: str | None
     power_entity: str | None
     capacity_entity: str | None
+
+
+@dataclass
+class BatteryHealth:
+    """A liveness sample for one battery (no control-loop involvement)."""
+
+    battery_id: str
+    available: bool          # SOC entity present and not unavailable
+    soc: float | None
+    soc_age_s: float | None  # seconds since the SOC sensor last updated
 
 
 @dataclass
@@ -108,6 +119,10 @@ class BatteryBridge:
 
     def __init__(self, hass: HomeAssistant) -> None:
         self._hass = hass
+        # Why the last set_passive failed, per battery ({} when all acked). The
+        # transport is the only layer that sees the exception text, so it parks it
+        # here for the supervisor to attach to the failure streak.
+        self.last_errors: dict[str, str] = {}
 
     # ---- reads ----------------------------------------------------------
     def read_all(self) -> list[BatteryState]:
@@ -129,6 +144,32 @@ class BatteryBridge:
                 )
             )
         return states
+
+    def read_health(self) -> list[BatteryHealth]:
+        """Per-battery liveness, independent of the control loop.
+
+        `soc_age_s` is the real signal: the base drops its sensors to unavailable
+        only after its own retries give up, whereas a SOC that simply stops
+        advancing shows a device going quiet in near-real time.
+        """
+        out: list[BatteryHealth] = []
+        for h in discover_batteries(self._hass):
+            state = self._hass.states.get(h.soc_entity) if h.soc_entity else None
+            available = (
+                state is not None and state.state.lower() not in _UNAVAILABLE
+            )
+            age = None
+            if state is not None:
+                age = (dt_util.utcnow() - state.last_updated).total_seconds()
+            out.append(
+                BatteryHealth(
+                    battery_id=h.battery_id,
+                    available=available,
+                    soc=self._read_float(h.soc_entity),
+                    soc_age_s=age,
+                )
+            )
+        return out
 
     def device_ids(self) -> list[str]:
         """All battery device_ids (for release/idle without a full read)."""
@@ -154,8 +195,12 @@ class BatteryBridge:
         One service call per battery (each carries its own power + device
         target), gathered concurrently. The base returns a per-target ack which
         we map back to the battery_id so a single UDP drop is visible.
+
+        Side effect: `self.last_errors` is refreshed with the reason each failing
+        battery failed, so the caller can pass it to the safety supervisor.
         """
         ids = [b for b in setpoints if b in device_by_id]
+        errors: dict[str, str] = {}
 
         async def _one(bid: str) -> tuple[str, bool]:
             try:
@@ -167,12 +212,17 @@ class BatteryBridge:
                     blocking=True,
                     return_response=True,
                 )
-                return bid, _resp_ok(resp)
+                ok = _resp_ok(resp)
+                if not ok:
+                    errors[bid] = "base returned no ack for the setpoint (set_result/timeout)"
+                return bid, ok
             except Exception as err:  # noqa: BLE001 - isolate one battery's failure
+                errors[bid] = f"{type(err).__name__}: {err}"
                 _LOGGER.debug("set_passive failed for %s: %s", bid, err)
                 return bid, False
 
         pairs = await asyncio.gather(*(_one(b) for b in ids))
+        self.last_errors = errors
         return dict(pairs)
 
     async def release_all(self, device_ids: list[str]) -> None:

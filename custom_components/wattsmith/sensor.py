@@ -121,10 +121,16 @@ class ManagerSensor(CoordinatorEntity, SensorEntity):
         return {
             "setpoints": data.get("setpoints"),
             "safety": data.get("safety"),
+            # Why the manager is in this state. The planner computes it every tick
+            # and it used to be dropped here, which forced hand-correlating raw
+            # sensor timestamps to explain a trip — surface it.
+            "reason": data.get("reason"),
             # cross-value config sanity findings (F-17) — empty list = all clear
             "config_warnings": data.get("config_warnings", []),
             # batteries excluded from discharge due to the anti-windup stall detector
             "stalled_batteries": data.get("stalled_ids", []),
+            # batteries not dispatched at all this tick, id -> why ({} = full fleet)
+            "excluded_batteries": data.get("excluded_batteries", {}),
             # True while actively importing from the grid to charge for arbitrage
             "arbitrage_charging": data.get("arb_charging", False),
         }

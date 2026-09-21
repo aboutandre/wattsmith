@@ -49,8 +49,11 @@ from .const import (
     CONF_WEATHER_SENSOR,
     DOMAIN,
 )
+from .safety import SOURCE_ACK, SOURCE_READ
 from .settings import (
     DEFAULT_EXPORT_PRICE,
+    HISTORY_HEALTH_HEARTBEAT_S,
+    HISTORY_HEALTH_PROBE_S,
     HISTORY_RETENTION_DAYS,
     HISTORY_SAMPLE_INTERVAL_S,
     HOUSE_CONSUMPTION_SENSOR,
@@ -58,7 +61,7 @@ from .settings import (
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: + battery_health liveness log
 BUCKET_SECONDS = 900  # 15 minutes
 _UNAVAILABLE = ("unknown", "unavailable", "none", "")
 
@@ -127,6 +130,20 @@ CREATE TABLE IF NOT EXISTS config_event (
   new_value  TEXT,
   source     TEXT
 );
+CREATE TABLE IF NOT EXISTS battery_health (
+  ts          INTEGER NOT NULL,
+  local_time  TEXT NOT NULL,
+  battery_id  TEXT NOT NULL,
+  available   INTEGER NOT NULL,
+  soc         REAL,
+  soc_age_s   REAL,
+  fails       INTEGER,
+  excluded    INTEGER,
+  last_error  TEXT,
+  PRIMARY KEY (ts, battery_id)
+);
+CREATE INDEX IF NOT EXISTS battery_health_by_battery
+  ON battery_health (battery_id, ts);
 CREATE TABLE IF NOT EXISTS meta ( key TEXT PRIMARY KEY, value TEXT );
 """
 
@@ -145,6 +162,26 @@ _QUERY_TS_COLUMN = {
 # ---------------------------------------------------------------------------
 # Pure helpers (no HA / sqlite) — unit tested
 # ---------------------------------------------------------------------------
+
+def _pick_fault(per_source: dict[str, Any]) -> tuple[int, bool, str | None]:
+    """Flatten one battery's per-source faults into the health row's columns.
+
+    The read streak wins when both are active: an unreadable device is the more
+    severe fault and the one that actually gates dispatch. The surviving reason is
+    tagged with its source so a row is self-describing.
+    """
+    for source in (SOURCE_READ, SOURCE_ACK):
+        fault = per_source.get(source)
+        if not fault:
+            continue
+        error = fault.get("last_error")
+        return (
+            int(fault.get("fails", 0) or 0),
+            bool(fault.get("excluded", False)),
+            f"[{source}] {error}" if error else f"[{source}]",
+        )
+    return 0, False, None
+
 
 def bucket_start(ts: float) -> int:
     """Floor an epoch timestamp to the start of its 15-minute bucket."""
@@ -373,9 +410,13 @@ class HistoryRecorder:
         self._last_sample_ts: float | None = None
         self._config_version = 1
         self._unsub = None
+        self._unsub_health = None
         self._started = False
         # latest arbitrage advisory, stamped onto the bucket when it flushes
         self._advisory: tuple[float, str, float, float] | None = None
+        # battery liveness: last row written per battery, for change detection
+        self._health_last: dict[str, tuple[bool, int, bool]] = {}
+        self._health_last_write: dict[str, float] = {}
 
     # ---- lifecycle ------------------------------------------------------
     async def async_start(self) -> None:
@@ -385,6 +426,9 @@ class HistoryRecorder:
         self._unsub = async_track_time_interval(
             self.hass, self._sample_cb, timedelta(seconds=HISTORY_SAMPLE_INTERVAL_S)
         )
+        self._unsub_health = async_track_time_interval(
+            self.hass, self._health_cb, timedelta(seconds=HISTORY_HEALTH_PROBE_S)
+        )
         self._started = True
         _LOGGER.info("Wattsmith history DB active at %s", self._db_path)
 
@@ -392,6 +436,9 @@ class HistoryRecorder:
         if self._unsub is not None:
             self._unsub()
             self._unsub = None
+        if self._unsub_health is not None:
+            self._unsub_health()
+            self._unsub_health = None
         # flush the partial bucket so a restart doesn't lose it
         if self._accum is not None and self._accum.sample_count > 0:
             await self._flush(self._accum)
@@ -430,6 +477,81 @@ class HistoryRecorder:
         self._last_sample_ts = mono
         # guard against a stalled loop crediting a huge dt to one sample
         self._accum.add(sample, min(dt, 2 * HISTORY_SAMPLE_INTERVAL_S))
+
+    # ---- battery liveness -----------------------------------------------
+    async def _health_cb(self, _now) -> None:
+        """Log per-battery liveness — change-triggered, with a slow heartbeat.
+
+        Deliberately independent of the control loop: when a battery goes silent
+        the loop just stops mentioning it, which is exactly when a separate,
+        timestamped record is worth having.
+        """
+        try:
+            rows = self._collect_health()
+        except Exception as err:  # noqa: BLE001 - observability must never break HA
+            _LOGGER.debug("battery health probe failed: %s", err)
+            return
+        if rows:
+            await self.hass.async_add_executor_job(self._write_health, rows)
+
+    def _collect_health(self) -> list[dict[str, Any]]:
+        """Build the rows that actually need writing this probe."""
+        now = time.time()
+        faults = self._supervisor_faults()
+        rows: list[dict[str, Any]] = []
+        for h in self.bridge.read_health():
+            fails, excluded, last_error = _pick_fault(faults.get(h.battery_id) or {})
+            key = (h.available, fails, excluded)
+            changed = self._health_last.get(h.battery_id) != key
+            stale = (
+                now - self._health_last_write.get(h.battery_id, 0.0)
+                >= HISTORY_HEALTH_HEARTBEAT_S
+            )
+            if not (changed or stale):
+                continue
+            self._health_last[h.battery_id] = key
+            self._health_last_write[h.battery_id] = now
+            if changed:
+                _LOGGER.info(
+                    "Battery %s liveness: available=%s fails=%d excluded=%s soc=%s age=%ss",
+                    h.battery_id, h.available, fails, excluded, h.soc,
+                    None if h.soc_age_s is None else round(h.soc_age_s),
+                )
+            rows.append({
+                "ts": int(now),
+                "local_time": datetime.now().isoformat(timespec="seconds"),
+                "battery_id": h.battery_id,
+                "available": 1 if h.available else 0,
+                "soc": h.soc,
+                "soc_age_s": h.soc_age_s,
+                "fails": fails,
+                "excluded": 1 if excluded else 0,
+                "last_error": last_error,
+            })
+        return rows
+
+    def _supervisor_faults(self) -> dict[str, dict[str, Any]]:
+        """The manager's live per-battery fault detail, if the manager is up."""
+        coordinator = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id)
+        data = getattr(coordinator, "data", None) or {}
+        safety = data.get("safety") or {}
+        faults = safety.get("battery_faults")
+        return faults if isinstance(faults, dict) else {}
+
+    def _write_health(self, rows: list[dict[str, Any]]) -> None:
+        conn = self._connect()
+        try:
+            conn.executemany(
+                "INSERT OR REPLACE INTO battery_health"
+                " (ts, local_time, battery_id, available, soc, soc_age_s, fails,"
+                "  excluded, last_error)"
+                " VALUES (:ts, :local_time, :battery_id, :available, :soc, :soc_age_s,"
+                "         :fails, :excluded, :last_error)",
+                rows,
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def _read_sample(self) -> Sample:
         o = self.entry.options

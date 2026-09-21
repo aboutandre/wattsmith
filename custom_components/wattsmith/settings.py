@@ -81,6 +81,11 @@ DEFAULT_BRIDGE_FLOOR_SOC: Final[float] = 50.0
 # === History DB ==============================================================
 HISTORY_SAMPLE_INTERVAL_S: Final[float] = 10.0   # power sampling for energy integration
 HISTORY_RETENTION_DAYS: Final[int] = 0           # 0 = keep forever (the DB is the point)
+# Battery liveness log: probed often (cheap — reads HA state, no device traffic) but
+# only WRITTEN on a state change or every heartbeat, so a healthy fleet costs ~1 row
+# per battery per heartbeat while an outage is timestamped to the probe interval.
+HISTORY_HEALTH_PROBE_S: Final[float] = 60.0
+HISTORY_HEALTH_HEARTBEAT_S: Final[float] = 900.0
 DEFAULT_EXPORT_PRICE: Final[float] = 0.07        # feed-in tariff EUR/kWh (opportunity cost)
 
 # === Battery economics / arbitrage ===========================================
@@ -97,5 +102,9 @@ DEFAULT_EXPECTED_CYCLES: Final[int] = 6000
 DEFAULT_ETA_SEED: Final[float] = 0.80
 ETA_MIN_DSOC: Final[float] = 8.0                 # min SOC swing for a usable η segment
 DEFAULT_MIN_ARBITRAGE_MARGIN_CT: Final[float] = 1.5   # skip sub-margin churn
+# Plan against the mean of Solcast's central and p10 estimates: missing a deficit
+# costs a peak-price import, overshooting costs only the spread plus wear.
+DEFAULT_ARBITRAGE_PV_CONFIDENCE: Final[str] = "blend"
+DEFAULT_FORECAST_MARGIN_PCT: Final[float] = 15.0
 ARBITRAGE_HORIZON_H: Final[float] = 36.0         # cap the planning horizon
 FLEET_CHARGE_POWER_W: Final[float] = 7500.0      # informational default (per-window energy cap)

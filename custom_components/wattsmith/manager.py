@@ -571,7 +571,9 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             elif plan.action == "send":
                 setpoints = {b: plan.setpoints[b] for b in plan.setpoints if b in device_by_id}
                 results = await self.bridge.set_passive(setpoints, device_by_id, MANAGER_CD_TIME_S)
-                state, reason = self.planner.record_send(now, results)
+                state, reason = self.planner.record_send(
+                    now, results, self.bridge.last_errors
+                )
             # "hold" / "idle": nothing to execute
 
             result = self._status(plan, state, reason, now)
@@ -596,6 +598,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             "command_total": plan.command_total,
             "setpoints": plan.setpoints,
             "stalled_ids": plan.stalled_ids,
+            "excluded_batteries": plan.excluded,
             "arb_charging": self._arb_charging,
             "safety": self.supervisor.status(now),
             "target_grid_w": self.controller.config.target_grid_w,
@@ -608,7 +611,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             "state": "error", "reason": err, "enabled": self.enabled,
             "grid_power": None, "ev_power": 0.0, "effective_grid": None,
             "command_total": 0, "setpoints": {},
-            "stalled_ids": [], "arb_charging": False,
+            "stalled_ids": [], "excluded_batteries": {}, "arb_charging": False,
             "safety": self.supervisor.status(now),
             "target_grid_w": self.controller.config.target_grid_w,
             "adaptive": self._adaptive_status(),

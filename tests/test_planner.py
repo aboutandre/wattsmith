@@ -165,6 +165,51 @@ def test_stall_clears_once_charged_back_out_of_near_floor_band():
     assert pl.command_total > 0
 
 
+def test_turnaround_after_a_direction_flip_is_not_a_stall():
+    # A battery reversing from charge to discharge takes seconds to deliver. That
+    # lag reads exactly like a hardware floor cutoff; latching on it is what locked
+    # the fleet out after an arbitrage grid-charge burst (2026-09-21).
+    p = make(min_soc=9.0, stall_flip_grace_s=60.0)
+    bb = [BatteryReading(f"b{i}", soc=13.0, power=0) for i in range(3)]
+    for i in range(3):
+        p._flip_at[f"b{i}"] = 0.0          # each just reversed at t=0
+    for i in range(4):
+        pl = p.plan(ob(i, 3000, key=f"k{i}", batteries=bb))
+    assert pl.stalled_ids == []            # inside the grace window
+
+    for i in range(100, 104):              # well past it -> the latch still works
+        pl = p.plan(ob(i, 3000, key=f"k{i}", batteries=bb))
+    assert set(pl.stalled_ids) == {"b0", "b1", "b2"}
+
+
+def test_stall_latch_releases_after_timeout_even_at_the_floor():
+    # Deadlock guard: an excluded battery can only leave the near-floor band by
+    # CHARGING, so on a sunless night it stayed excluded for hours while the house
+    # imported at peak price. The timeout forces a re-test.
+    p = make(min_soc=9.0, stall_release_s=300.0)
+    bb = [BatteryReading(f"b{i}", soc=13.0, power=0) for i in range(3)]
+    for i in range(4):
+        pl = p.plan(ob(i, 3000, key=f"k{i}", batteries=bb))
+    assert set(pl.stalled_ids) == {"b0", "b1", "b2"}
+    assert pl.command_total == 0
+
+    pl = p.plan(ob(400, 3000, key="k-retest", batteries=bb))
+    assert pl.stalled_ids == []            # still at the floor, but re-tested
+    assert pl.command_total > 0
+
+
+def test_direction_flip_is_recorded_only_on_a_real_reversal():
+    p = make()
+    p._note_direction_flips({"b0": 500}, now=10.0)      # first non-zero: no flip
+    assert "b0" not in p._flip_at
+    p._note_direction_flips({"b0": 700}, now=20.0)      # same direction: no flip
+    assert "b0" not in p._flip_at
+    p._note_direction_flips({"b0": 0}, now=25.0)        # idle doesn't clear the sign
+    assert "b0" not in p._flip_at
+    p._note_direction_flips({"b0": -400}, now=30.0)     # reversal
+    assert p._flip_at["b0"] == 30.0
+
+
 # ---- normal dispatch + dedup + throttle -------------------------------
 def test_normal_dispatch_sends():
     pl = make().plan(ob(100, 500))
@@ -280,6 +325,87 @@ def test_safe_does_not_recover_while_grid_stale():
     p.plan(ob(100, None))                     # no grid -> SAFE
     for t in range(5):
         assert p.plan(ob(110 + t, None)).state == "safe"
+
+
+# ---- dispatch-set observability (the F11 blind spot) ------------------
+def _dead(bid):
+    """A battery the base can no longer read (device unavailable)."""
+    return BatteryReading(id=bid, soc=None, read_ok=False)
+
+
+def test_excluded_map_explains_why_each_battery_is_not_dispatched():
+    p = make()
+    batts = [
+        BatteryReading(id="b0", soc=90),
+        _dead("b1"),
+        BatteryReading(id="b2", soc=None),   # responding, but no usable SOC
+    ]
+    plan = p.plan(ob(100, 500, batteries=batts))
+    assert plan.healthy_ids == ["b0"]
+    assert plan.excluded == {
+        "b1": "not responding",
+        "b2": "no SOC reading",
+    }
+
+
+def test_unreadable_battery_stays_excluded_while_it_stays_dead():
+    p = make()
+    dying = [BatteryReading(id="b0", soc=90), _dead("b1")]
+    for t in (100, 103, 106, 109):
+        plan = p.plan(ob(t, 500, batteries=dying))
+    assert plan.healthy_ids == ["b0"]
+    assert plan.excluded == {"b1": "not responding"}
+    # the watchdog has also latched it out (>= threshold consecutive read failures)
+    assert not p.supervisor.battery_healthy("b1")
+    assert p.supervisor.battery_fault("b1").excluded is True
+
+
+def test_dispatch_drop_and_return_are_logged_once_each(caplog=None):
+    """A battery leaving/rejoining dispatch logs on the TRANSITION only."""
+    import logging as _logging
+
+    records = []
+
+    class _Capture(_logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Capture()
+    log = _logging.getLogger(planner.__name__)
+    log.addHandler(handler)
+    log.setLevel(_logging.INFO)
+    try:
+        p = make()
+        alive = [BatteryReading(id="b0", soc=90), BatteryReading(id="b1", soc=90)]
+        gone = [BatteryReading(id="b0", soc=90), _dead("b1")]
+        p.plan(ob(100, 500, batteries=alive))          # first tick: baseline, no log
+        assert not [r for r in records if "DROPPED" in r]
+        p.plan(ob(103, 500, batteries=gone))           # b1 leaves -> one warning
+        p.plan(ob(106, 500, batteries=gone))           # still gone -> no repeat
+        dropped = [r for r in records if "DROPPED" in r]
+        assert len(dropped) == 1
+        assert "b1" in dropped[0] and "Fleet is now 1" in dropped[0]
+
+        p.plan(ob(109, 500, batteries=alive))          # b1 returns -> one warning
+        rejoined = [r for r in records if "RE-ENTERED" in r]
+        assert len(rejoined) == 1
+        assert "b1" in rejoined[0] and "Fleet is now 2" in rejoined[0]
+    finally:
+        log.removeHandler(handler)
+
+
+def test_send_errors_are_attached_to_the_ack_failure_streak():
+    p = make()
+    p.plan(ob(100, 500))
+    p.record_send(100, {"b0": True, "b1": False}, {"b1": "TimeoutError: no ack"})
+    fault = p.supervisor.battery_fault("b1", source=safety.SOURCE_ACK)
+    assert fault.fails == 1
+    assert fault.last_error == "TimeoutError: no ack"
+    assert fault.first_fail_ts == 100
+    # a failure with no detail still records a usable default
+    p.record_send(103, {"b0": True, "b1": False})
+    ack = p.supervisor.battery_fault("b1", source=safety.SOURCE_ACK)
+    assert ack.fails == 2 and ack.last_error == "setpoint not acknowledged"
 
 
 if __name__ == "__main__":

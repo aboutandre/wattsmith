@@ -10,6 +10,7 @@ Or with pytest: pytest tests/test_battery_bridge.py
 import asyncio
 import importlib.util
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock
@@ -28,6 +29,14 @@ sys.modules["homeassistant"] = MagicMock()
 sys.modules["homeassistant.core"] = MagicMock()
 sys.modules["homeassistant.helpers"] = _helpers_mock
 sys.modules["homeassistant.helpers.entity_registry"] = _er_mock
+
+# dt_util: read_health() ages the SOC sensor against the current time.
+_util = ModuleType("homeassistant.util")
+_dt = ModuleType("homeassistant.util.dt")
+_dt.utcnow = lambda: datetime.now(timezone.utc)
+_util.dt = _dt
+sys.modules["homeassistant.util"] = _util
+sys.modules["homeassistant.util.dt"] = _dt
 
 # ── stub the wattsmith package and const relative import ─────────────────────
 _pkg = ModuleType("wattsmith")
@@ -102,19 +111,28 @@ class _FakeReg:
         return self.entities.get(entity_id)
 
 
-def _make_hass(ents, state_map=None):
-    """Mock hass backed by a given entity list and optional state values."""
+def _make_hass(ents, state_map=None, age_map=None):
+    """Mock hass backed by a given entity list and optional state values.
+
+    `age_map` sets how many seconds ago each entity last updated (default 0), which
+    read_health() turns into soc_age_s.
+    """
     hass = MagicMock()
     reg = _FakeReg(ents)
     _er_mock.async_get.return_value = reg  # er.async_get(hass) returns our registry
 
     state_map = state_map or {}
+    age_map = age_map or {}
 
     def _get(entity_id):
         if entity_id not in state_map:
             return None
         s = MagicMock()
         s.state = state_map[entity_id]
+        # real datetime, not a MagicMock: read_health does arithmetic on it
+        s.last_updated = datetime.now(timezone.utc) - timedelta(
+            seconds=age_map.get(entity_id, 0)
+        )
         return s
 
     hass.states.get.side_effect = _get
@@ -244,8 +262,93 @@ def test_read_all_non_numeric_state():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BatteryBridge.read_health (liveness probe)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_read_health_reports_a_live_battery():
+    ents = _battery_ents("entry_a", "device_a")
+    hass = _make_hass(ents, {"sensor.entry_a_soc": "54"}, {"sensor.entry_a_soc": 12})
+    (h,) = BatteryBridge(hass).read_health()
+    assert h.battery_id == "entry_a"
+    assert h.available is True
+    assert h.soc == 54.0
+    assert 11 <= h.soc_age_s <= 14        # ~12s since last update
+
+
+def test_read_health_flags_an_unavailable_battery():
+    """The F11 signature: the SOC entity exists but the base dropped it."""
+    ents = _battery_ents("entry_a", "device_a")
+    hass = _make_hass(ents, {"sensor.entry_a_soc": "unavailable"})
+    (h,) = BatteryBridge(hass).read_health()
+    assert h.available is False
+    assert h.soc is None
+    assert h.soc_age_s is not None        # we still know WHEN it went unavailable
+
+
+def test_read_health_reports_a_silently_stale_battery():
+    """Still 'available', but the SOC stopped advancing — the early warning."""
+    ents = _battery_ents("entry_a", "device_a")
+    hass = _make_hass(ents, {"sensor.entry_a_soc": "54"}, {"sensor.entry_a_soc": 3600})
+    (h,) = BatteryBridge(hass).read_health()
+    assert h.available is True
+    assert h.soc_age_s >= 3599
+
+
+def test_read_health_covers_every_discovered_battery():
+    ents = _battery_ents("entry_a", "device_a") + _battery_ents("entry_b", "device_b")
+    hass = _make_hass(
+        ents, {"sensor.entry_a_soc": "54", "sensor.entry_b_soc": "unavailable"}
+    )
+    health = {h.battery_id: h for h in BatteryBridge(hass).read_health()}
+    assert set(health) == {"entry_a", "entry_b"}
+    assert health["entry_a"].available is True
+    assert health["entry_b"].available is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # BatteryBridge.set_passive
 # ══════════════════════════════════════════════════════════════════════════════
+
+async def test_set_passive_records_no_errors_when_all_ack():
+    hass = MagicMock()
+    hass.services.async_call = AsyncMock(
+        return_value={"results": {"e": {"ok": True}}}
+    )
+    bridge = BatteryBridge(hass)
+    await bridge.set_passive({"e": 100}, {"e": "dev_e"}, 0)
+    assert bridge.last_errors == {}
+
+
+async def test_set_passive_records_why_a_battery_failed():
+    hass = MagicMock()
+    hass.services.async_call = AsyncMock(side_effect=RuntimeError("UDP gone"))
+    bridge = BatteryBridge(hass)
+    await bridge.set_passive({"e": 100}, {"e": "dev_e"}, 0)
+    assert bridge.last_errors == {"e": "RuntimeError: UDP gone"}
+
+
+async def test_set_passive_records_a_nack_distinctly_from_an_exception():
+    hass = MagicMock()
+    hass.services.async_call = AsyncMock(
+        return_value={"results": {"e": {"ok": False}}}
+    )
+    bridge = BatteryBridge(hass)
+    await bridge.set_passive({"e": 100}, {"e": "dev_e"}, 0)
+    assert "no ack" in bridge.last_errors["e"]
+
+
+async def test_set_passive_errors_are_cleared_on_recovery():
+    hass = MagicMock()
+    hass.services.async_call = AsyncMock(side_effect=RuntimeError("UDP gone"))
+    bridge = BatteryBridge(hass)
+    await bridge.set_passive({"e": 100}, {"e": "dev_e"}, 0)
+    assert bridge.last_errors
+    hass.services.async_call = AsyncMock(
+        return_value={"results": {"e": {"ok": True}}}
+    )
+    await bridge.set_passive({"e": 100}, {"e": "dev_e"}, 0)
+    assert bridge.last_errors == {}   # stale reasons must not linger
+
 
 async def test_set_passive_calls_correct_service():
     hass = MagicMock()

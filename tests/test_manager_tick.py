@@ -129,6 +129,8 @@ class FakeBridge:
         self.ack = ack
         self.sent: list[dict] = []
         self.released = 0
+        # mirrors the real bridge: why each battery failed its last setpoint write
+        self.last_errors: dict[str, str] = {}
 
     def read_all(self):
         return self.batteries
@@ -138,6 +140,9 @@ class FakeBridge:
 
     async def set_passive(self, setpoints, device_by_id, cd_time):
         self.sent.append(dict(setpoints))
+        self.last_errors = (
+            {} if self.ack else {bid: "fake nack" for bid in setpoints}
+        )
         return {bid: self.ack for bid in setpoints}
 
     async def release_all(self, device_ids):

@@ -11,6 +11,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
@@ -22,6 +23,14 @@ sys.modules["homeassistant.core"] = MagicMock()
 sys.modules["homeassistant.helpers"] = MagicMock()
 sys.modules["homeassistant.helpers.event"] = MagicMock()
 sys.modules["homeassistant.helpers.entity_registry"] = MagicMock()
+
+# dt_util: battery_bridge.read_health() ages the SOC sensor against the current time.
+_util = ModuleType("homeassistant.util")
+_dt = ModuleType("homeassistant.util.dt")
+_dt.utcnow = lambda: datetime.now(timezone.utc)
+_util.dt = _dt
+sys.modules["homeassistant.util"] = _util
+sys.modules["homeassistant.util.dt"] = _dt
 
 _pkg = ModuleType("wattsmith")
 sys.modules["wattsmith"] = _pkg
@@ -39,6 +48,7 @@ def _load(name: str):
 
 _load("const")
 _load("settings")
+_load("safety")          # history_db reads the fault-source labels from here
 _load("battery_bridge")
 h = _load("history_db")
 
@@ -144,6 +154,109 @@ def test_init_db_creates_schema():
         assert {"bucket", "battery_bucket", "battery", "config_snapshot",
                 "config_event", "meta"} <= tables
         conn.close()
+
+
+def _health(bid="f11", available=True, soc=54.0, age=5.0):
+    return SimpleNamespace(
+        battery_id=bid, available=available, soc=soc, soc_age_s=age
+    )
+
+
+def test_battery_health_table_round_trip():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = os.path.join(d, "history.db")
+        rec = _recorder(tmp)
+        rec._init_db()
+        rec._write_health([{
+            "ts": 1000, "local_time": "2026-08-26T06:28:18", "battery_id": "f11",
+            "available": 0, "soc": None, "soc_age_s": 97000.0, "fails": 32474,
+            "excluded": 1, "last_error": "device unavailable",
+        }])
+        conn = sqlite3.connect(tmp)
+        row = conn.execute(
+            "SELECT battery_id, available, fails, excluded, last_error"
+            " FROM battery_health"
+        ).fetchone()
+        assert row == ("f11", 0, 32474, 1, "device unavailable")
+        conn.close()
+
+
+def test_health_probe_writes_on_change_then_stays_quiet():
+    """A healthy fleet must not write a row per probe — only on change."""
+    with tempfile.TemporaryDirectory() as d:
+        rec = _recorder(os.path.join(d, "history.db"))
+        rec.bridge = MagicMock()
+        rec.bridge.read_health.return_value = [_health()]
+        rec._supervisor_faults = lambda: {}
+
+        assert len(rec._collect_health()) == 1     # first sighting is a change
+        assert rec._collect_health() == []         # unchanged -> nothing to write
+        assert rec._collect_health() == []
+
+
+def test_health_probe_writes_when_a_battery_goes_unavailable():
+    with tempfile.TemporaryDirectory() as d:
+        rec = _recorder(os.path.join(d, "history.db"))
+        rec.bridge = MagicMock()
+        rec.bridge.read_health.return_value = [_health()]
+        rec._supervisor_faults = lambda: {}
+        rec._collect_health()                       # baseline
+        assert rec._collect_health() == []
+
+        # the battery drops out, and the supervisor has fault detail for it
+        rec.bridge.read_health.return_value = [
+            _health(available=False, soc=None, age=90.0)
+        ]
+        rec._supervisor_faults = lambda: {
+            "f11": {"not_responding": {"fails": 7, "excluded": True,
+                                       "last_error": "timeout"}}
+        }
+        rows = rec._collect_health()
+        assert len(rows) == 1
+        assert rows[0]["available"] == 0
+        assert rows[0]["fails"] == 7
+        assert rows[0]["excluded"] == 1
+        # the reason is tagged with which failure mode it came from
+        assert rows[0]["last_error"] == "[not_responding] timeout"
+
+
+def test_pick_fault_prefers_the_read_streak_over_the_ack_streak():
+    read = {"fails": 5, "excluded": True, "last_error": "unavailable"}
+    ack = {"fails": 2, "excluded": False, "last_error": "no ack"}
+    assert h._pick_fault({"not_responding": read, "not_acking": ack}) == (
+        5, True, "[not_responding] unavailable"
+    )
+    # ack-only failures are still recorded, clearly labelled
+    assert h._pick_fault({"not_acking": ack}) == (2, False, "[not_acking] no ack")
+    assert h._pick_fault({}) == (0, False, None)
+
+
+def test_health_probe_heartbeats_even_when_nothing_changes():
+    with tempfile.TemporaryDirectory() as d:
+        rec = _recorder(os.path.join(d, "history.db"))
+        rec.bridge = MagicMock()
+        rec.bridge.read_health.return_value = [_health()]
+        rec._supervisor_faults = lambda: {}
+        rec._collect_health()
+        assert rec._collect_health() == []
+        # pretend the last write was longer ago than the heartbeat interval
+        rec._health_last_write["f11"] -= (h.HISTORY_HEALTH_HEARTBEAT_S + 1)
+        assert len(rec._collect_health()) == 1
+
+
+def test_health_probe_tracks_each_battery_independently():
+    with tempfile.TemporaryDirectory() as d:
+        rec = _recorder(os.path.join(d, "history.db"))
+        rec.bridge = MagicMock()
+        rec.bridge.read_health.return_value = [_health("f9"), _health("f11")]
+        rec._supervisor_faults = lambda: {}
+        assert len(rec._collect_health()) == 2
+        # only f11 changes -> only f11 is written
+        rec.bridge.read_health.return_value = [
+            _health("f9"), _health("f11", available=False, soc=None)
+        ]
+        rows = rec._collect_health()
+        assert [r["battery_id"] for r in rows] == ["f11"]
 
 
 def test_config_versioning_snapshot_and_events():

@@ -27,6 +27,45 @@ from .economics import effective_cost_ct, is_profitable
 
 BUCKET_H = 0.25  # 15 minutes
 
+# How much of the Solcast spread to plan against. Under-buying costs a peak-price
+# import; over-buying costs only the spread plus wear — the risk is asymmetric, so
+# the default leans low rather than taking the central estimate at face value.
+PV_CONFIDENCE_LEVELS = ("central", "blend", "pessimistic")
+
+
+def local_hour(ts: float) -> int:
+    """Hour-of-day (0-23) in LOCAL time for an epoch timestamp.
+
+    MUST match BaselineLearner.observe(), which keys its samples by
+    datetime.fromtimestamp(...).hour — process-local. Indexing the learned load
+    profile by the UTC hour instead silently rotates it by the UTC offset: in
+    CEST (+2) the morning ramp landed two hours late, so the forward sim saw a
+    quiet house at breakfast, under-bought overnight, and left the fleet at its
+    floor through the 08:00 price peak (observed 2026-09-21).
+    """
+    return datetime.fromtimestamp(ts).hour
+
+
+def _period_estimate(period: dict, confidence: str) -> float | None:
+    """Pick a period's kW estimate at the requested confidence level."""
+    central = period.get("pv_estimate")
+    low = period.get("pv_estimate10")
+    if confidence == "pessimistic" and low is not None:
+        pick = low
+    elif confidence == "blend" and low is not None and central is not None:
+        try:
+            return (float(central) + float(low)) / 2.0
+        except (ValueError, TypeError):
+            return None
+    else:
+        pick = central
+    if pick is None:
+        return None
+    try:
+        return float(pick)
+    except (ValueError, TypeError):
+        return None
+
 
 @dataclass(frozen=True)
 class Bucket:
@@ -65,8 +104,7 @@ def build_buckets(
             break  # beyond the confirmed horizon
         pv = pv_by_slot.get(ts, 0.0)
         if load_by_hour:
-            hour = int((ts % 86400) // 3600)
-            load = load_by_hour[hour % 24]
+            load = load_by_hour[local_hour(ts) % 24]
         else:
             load = 0.0
         buckets.append(Bucket(price_ct=price * 100.0, pv_wh=pv, load_wh=load))
@@ -74,17 +112,24 @@ def build_buckets(
     return buckets
 
 
-def pv_slots_from_detailed(periods: list[dict]) -> dict[int, float]:
+def pv_slots_from_detailed(
+    periods: list[dict], confidence: str = "central"
+) -> dict[int, float]:
     """Solcast detailed forecast -> {bucket_start_epoch: forecast_Wh per 15-min}.
 
-    Each period is {period_start: iso, pv_estimate: kW-average}. Energy in a
-    15-min slot = pv_estimate(kW) × 0.25 h × 1000 = Wh. A 30-min period seeds
-    both of its 15-min sub-slots. Any unparsable period is skipped.
+    Each period is {period_start: iso, pv_estimate: kW-average} and, when Solcast
+    supplies them, pv_estimate10/pv_estimate90. Energy in a 15-min slot =
+    estimate(kW) × 0.25 h × 1000 = Wh. A 30-min period seeds both of its 15-min
+    sub-slots. Any unparsable period is skipped.
+
+    `confidence` selects which estimate to plan against: "central" (Solcast's
+    p50), "pessimistic" (p10) or "blend" (their mean). Falls back to the central
+    estimate whenever p10 is absent.
     """
     out: dict[int, float] = {}
     for p in periods:
         start = p.get("period_start")
-        est = p.get("pv_estimate")
+        est = _period_estimate(p, confidence)
         if start is None or est is None:
             continue
         if isinstance(start, str):
@@ -98,10 +143,7 @@ def pv_slots_from_detailed(periods: list[dict]) -> dict[int, float]:
             continue
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        try:
-            wh = float(est) * 0.25 * 1000.0
-        except (ValueError, TypeError):
-            continue
+        wh = est * 0.25 * 1000.0  # _period_estimate already coerced to float
         base = int(dt.timestamp() // 900) * 900
         # a Solcast period is 30 min -> fill both 15-min sub-slots
         out[base] = wh

@@ -170,6 +170,79 @@ def test_pv_slots_skips_bad_periods():
     assert a.pv_slots_from_detailed([{"period_start": "nope", "pv_estimate": 1}]) == {}
 
 
+# ---- load profile is keyed by LOCAL hour (must match BaselineLearner) ----
+def test_load_profile_indexed_by_local_not_utc_hour():
+    # The learner keys its samples by datetime.fromtimestamp(...).hour. Indexing the
+    # profile by the UTC hour rotates it by the UTC offset: in CEST that put the
+    # morning ramp two hours late, so the sim under-bought for it (2026-09-21).
+    import os
+    import time as _time
+    from datetime import datetime
+
+    old_tz = os.environ.get("TZ")
+    os.environ["TZ"] = "Europe/Berlin"
+    _time.tzset()
+    try:
+        ts = 1789966800                      # 2026-09-21T05:00Z == 07:00 CEST
+        assert datetime.fromtimestamp(ts).hour == 7, "fixture is not 07:00 local"
+        load = [0.0] * 24
+        load[7] = 800.0                      # the breakfast ramp, at LOCAL 07:00
+        buckets = a.build_buckets(ts, [(ts, 0.30)], {}, load, horizon_h=0.25)
+        assert buckets[0].load_wh == 800.0   # would be load[5] == 0.0 under UTC
+    finally:
+        if old_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old_tz
+        _time.tzset()
+
+
+# ---- PV confidence level ------------------------------------------------
+def test_pv_confidence_selects_central_pessimistic_or_blend():
+    periods = [{"period_start": "1970-01-01T00:00:00+00:00",
+                "pv_estimate": 2.0, "pv_estimate10": 1.0}]
+    assert a.pv_slots_from_detailed(periods, "central")[0] == 500.0       # 2.0 kW
+    assert a.pv_slots_from_detailed(periods, "pessimistic")[0] == 250.0   # 1.0 kW
+    assert a.pv_slots_from_detailed(periods, "blend")[0] == 375.0         # mean
+
+
+def test_pv_confidence_falls_back_to_central_without_p10():
+    periods = [{"period_start": "1970-01-01T00:00:00+00:00", "pv_estimate": 2.0}]
+    for level in a.PV_CONFIDENCE_LEVELS:
+        assert a.pv_slots_from_detailed(periods, level)[0] == 500.0
+
+
+def test_pessimistic_pv_buys_more_than_central():
+    # PV forecast to land inside the EXPENSIVE window: against p10 it no longer
+    # covers that load, so the unmet deficit — and the earmark — grows.
+    periods = [{"period_start": "1970-01-01T01:00:00+00:00",   # the 40 ct hour
+                "pv_estimate": 4.0, "pv_estimate10": 0.4}]
+    prices = [(0.0, 0.12), (3600.0, 0.40)]
+    bat = BatteryModel(soc_pct=11.0, capacity_wh=15360.0, min_soc=11.0,
+                       max_soc=100.0, charge_power_w=7500.0)
+    plans = {}
+    for level in ("central", "pessimistic"):
+        buckets = a.build_buckets(
+            0.0, prices, a.pv_slots_from_detailed(periods, level),
+            [2000.0] * 24, horizon_h=2.0)
+        plans[level] = plan_arbitrage(buckets, bat, ECON)
+    assert (plans["pessimistic"].profitable_deficit_wh
+            > plans["central"].profitable_deficit_wh)
+
+
+# ---- forecast margin ----------------------------------------------------
+def test_bigger_forecast_margin_earmarks_more():
+    buckets = _flat([12] + [35] * 4, load=2000.0, pv=0.0)
+    bat = BatteryModel(soc_pct=20.0, capacity_wh=15360.0, min_soc=11.0,
+                       max_soc=100.0, charge_power_w=7500.0)
+    lean = plan_arbitrage(buckets, bat, Econ(eta=0.78, wear_ct=3.26, min_margin_ct=1.5,
+                                             forecast_margin_frac=0.0))
+    padded = plan_arbitrage(buckets, bat, Econ(eta=0.78, wear_ct=3.26, min_margin_ct=1.5,
+                                               forecast_margin_frac=0.5))
+    assert padded.hold_floor_soc >= lean.hold_floor_soc
+    assert padded.grid_charge_now_wh >= lean.grid_charge_now_wh
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

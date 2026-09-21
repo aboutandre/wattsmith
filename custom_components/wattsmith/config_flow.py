@@ -10,14 +10,17 @@ from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector
 
+from .arbitrage import PV_CONFIDENCE_LEVELS
 from .battery_bridge import discover_batteries
 from .const import (
     CONF_ARBITRAGE_ENABLED,
+    CONF_ARBITRAGE_PV_CONFIDENCE,
     CONF_BATTERY_CONFIG,
     CONF_CAR_STATE_SENSOR,
     CONF_ETA_OVERRIDE,
     CONF_EV_SENSOR,
     CONF_EXPORT_PRICE,
+    CONF_FORECAST_MARGIN_PCT,
     CONF_GOE_IP,
     CONF_GRID_SENSOR,
     CONF_HISTORY_DB_PATH,
@@ -35,8 +38,10 @@ from .const import (
     DOMAIN,
 )
 from .settings import (
+    DEFAULT_ARBITRAGE_PV_CONFIDENCE,
     DEFAULT_EXPECTED_CYCLES,
     DEFAULT_EXPORT_PRICE,
+    DEFAULT_FORECAST_MARGIN_PCT,
     DEFAULT_MIN_ARBITRAGE_MARGIN_CT,
     HISTORY_RETENTION_DAYS,
 )
@@ -157,6 +162,10 @@ class WattsmithOptionsFlow(config_entries.OptionsFlow):
             new_options[CONF_ARBITRAGE_ENABLED] = bool(user_input.get(CONF_ARBITRAGE_ENABLED, False))
             new_options[CONF_MIN_ARBITRAGE_MARGIN_CT] = float(
                 user_input.get(CONF_MIN_ARBITRAGE_MARGIN_CT, DEFAULT_MIN_ARBITRAGE_MARGIN_CT))
+            new_options[CONF_ARBITRAGE_PV_CONFIDENCE] = str(user_input.get(
+                CONF_ARBITRAGE_PV_CONFIDENCE, DEFAULT_ARBITRAGE_PV_CONFIDENCE))
+            new_options[CONF_FORECAST_MARGIN_PCT] = float(
+                user_input.get(CONF_FORECAST_MARGIN_PCT, DEFAULT_FORECAST_MARGIN_PCT))
             for key in (CONF_WEAR_COST_CT, CONF_ETA_OVERRIDE, CONF_IMPORT_POWER_CAP_W):
                 v = user_input.get(key)
                 if v in (None, ""):
@@ -192,6 +201,15 @@ class WattsmithOptionsFlow(config_entries.OptionsFlow):
                          default=float(o.get(CONF_MIN_ARBITRAGE_MARGIN_CT, DEFAULT_MIN_ARBITRAGE_MARGIN_CT))):
                 selector.NumberSelector(selector.NumberSelectorConfig(
                     min=0, max=20, step=0.5, mode="box", unit_of_measurement="ct/kWh")),
+            vol.Optional(CONF_ARBITRAGE_PV_CONFIDENCE,
+                         default=str(o.get(CONF_ARBITRAGE_PV_CONFIDENCE,
+                                           DEFAULT_ARBITRAGE_PV_CONFIDENCE))):
+                selector.SelectSelector(selector.SelectSelectorConfig(
+                    options=list(PV_CONFIDENCE_LEVELS), mode="dropdown")),
+            vol.Optional(CONF_FORECAST_MARGIN_PCT,
+                         default=float(o.get(CONF_FORECAST_MARGIN_PCT, DEFAULT_FORECAST_MARGIN_PCT))):
+                selector.NumberSelector(selector.NumberSelectorConfig(
+                    min=0, max=100, step=5, mode="box", unit_of_measurement="%")),
             vol.Optional(CONF_WEAR_COST_CT, description=_suggest(o.get(CONF_WEAR_COST_CT, ""))):
                 selector.NumberSelector(selector.NumberSelectorConfig(
                     min=0, max=30, step=0.1, mode="box", unit_of_measurement="ct/kWh")),
