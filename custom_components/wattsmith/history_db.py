@@ -150,10 +150,11 @@ CREATE TABLE IF NOT EXISTS meta ( key TEXT PRIMARY KEY, value TEXT );
 # Tables the query_history service is allowed to read (fixed allow-list — the
 # table name is interpolated into SQL, so anything outside this set is rejected
 # before it ever reaches sqlite).
-QUERY_TABLES = ("bucket", "battery_bucket", "config_snapshot", "config_event")
+QUERY_TABLES = ("bucket", "battery_bucket", "battery_health", "config_snapshot", "config_event")
 _QUERY_TS_COLUMN = {
     "bucket": "ts_start",
     "battery_bucket": "ts_start",
+    "battery_health": "ts",
     "config_snapshot": "ts",
     "config_event": "ts",
 }

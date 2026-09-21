@@ -369,8 +369,38 @@ def test_query_range_rejects_unknown_table():
 
 
 def test_query_tables_matches_schema():
-    # every allowed table must actually exist in the schema
-    assert set(QUERY_TABLES) == {"bucket", "battery_bucket", "config_snapshot", "config_event"}
+    # Every allowed table must actually exist in the schema. Derived from SCHEMA
+    # rather than hardcoded, so adding a table can't silently drift from this
+    # test (battery_health was added to the schema but left out of QUERY_TABLES,
+    # and the old hardcoded set hid it).
+    import re
+    in_schema = set(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", h.SCHEMA))
+    assert set(QUERY_TABLES) <= in_schema, set(QUERY_TABLES) - in_schema
+
+
+def test_every_query_table_has_a_timestamp_column():
+    # query_range() indexes _QUERY_TS_COLUMN[table]; a missing entry is a KeyError
+    # at call time rather than a clean ValueError.
+    missing = [t for t in QUERY_TABLES if t not in h._QUERY_TS_COLUMN]
+    assert not missing, missing
+
+
+def test_battery_health_is_queryable_end_to_end():
+    # The liveness log is only useful if it can actually be pulled back out.
+    with tempfile.TemporaryDirectory() as d:
+        rec = _recorder(os.path.join(d, "history.db"))
+        rec._init_db()
+        conn = sqlite3.connect(os.path.join(d, "history.db"))
+        conn.execute(
+            "INSERT INTO battery_health (ts, local_time, battery_id, available,"
+            " soc, soc_age_s, fails, excluded, last_error)"
+            " VALUES (500, '1970-01-01T00:08:20', 'b0', 1, 42.0, 3.0, 0, 0, NULL)"
+        )
+        conn.commit()
+        conn.close()
+        rows = rec.query_range(0, 1000, table="battery_health")
+        assert len(rows) == 1
+        assert rows[0]["battery_id"] == "b0" and rows[0]["soc"] == 42.0
 
 
 if __name__ == "__main__":

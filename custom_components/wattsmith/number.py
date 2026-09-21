@@ -120,7 +120,7 @@ NUMBERS: tuple[ManagerNumber, ...] = (
     # Read by the ARBITRAGE coordinator (it re-reads options every tick), but it
     # belongs on the manager device next to the other tuning knobs.
     ManagerNumber(CONF_FORECAST_MARGIN_PCT, "Arbitrage Forecast Margin", 0, 100, 5, "%",
-                  "mdi:shield-percent",
+                  "mdi:cloud-percent",
                   lambda c: float(c.entry.options.get(CONF_FORECAST_MARGIN_PCT,
                                                       DEFAULT_FORECAST_MARGIN_PCT))),
 )
