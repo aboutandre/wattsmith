@@ -151,6 +151,24 @@ def pv_slots_from_detailed(
     return out
 
 
+def solcast_forecast_entities(configured: str) -> list[str]:
+    """The Solcast entities whose detailedForecast together cover the horizon.
+
+    The HA Solcast integration splits the forecast per day: `…_forecast_today`
+    holds 00:00-23:30 of today only, and tomorrow lives in `…_forecast_tomorrow`.
+    Tomorrow's prices publish ~13:00, so from then on the horizon runs into a day
+    the today-sensor knows nothing about — and build_buckets() reads a missing PV
+    slot as 0 W, i.e. "tomorrow has no sun" (hel-131). When the configured entity
+    is a `_forecast_today` sensor, its `_forecast_tomorrow` sibling is added.
+    """
+    if not configured:
+        return []
+    out = [configured]
+    if configured.endswith("_forecast_today"):
+        out.append(configured[: -len("today")] + "tomorrow")
+    return out
+
+
 def _price_at(prices: list[tuple[float, float]], ts: int) -> float | None:
     """Price (EUR/kWh) of the published interval covering `ts`, or None if past end."""
     covering = None

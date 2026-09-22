@@ -22,7 +22,14 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from .arbitrage import BatteryModel, Econ, build_buckets, plan_arbitrage, pv_slots_from_detailed
+from .arbitrage import (
+    BatteryModel,
+    Econ,
+    build_buckets,
+    plan_arbitrage,
+    pv_slots_from_detailed,
+    solcast_forecast_entities,
+)
 from .battery_bridge import BatteryBridge
 from .const import (
     CONF_ARBITRAGE_ENABLED,
@@ -227,17 +234,18 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         return out
 
     def _pv_by_slot(self) -> dict[int, float]:
-        eid = self.entry.options.get(CONF_SOLCAST_FORECAST_SENSOR)
-        if not eid:
-            return {}
-        st = self.hass.states.get(eid)
-        if st is None or not st.attributes:
-            return {}
-        periods = st.attributes.get("detailedForecast") or st.attributes.get("detailedHourly")
+        """PV forecast per 15-min slot across today AND tomorrow (hel-131)."""
+        periods: list = []
+        for eid in solcast_forecast_entities(self.entry.options.get(CONF_SOLCAST_FORECAST_SENSOR) or ""):
+            st = self.hass.states.get(eid)
+            if st is None or not st.attributes:
+                continue
+            p = st.attributes.get("detailedForecast") or st.attributes.get("detailedHourly")
+            if isinstance(p, list):
+                periods.extend(p)
         confidence = self.entry.options.get(
             CONF_ARBITRAGE_PV_CONFIDENCE, DEFAULT_ARBITRAGE_PV_CONFIDENCE)
-        return pv_slots_from_detailed(
-            periods if isinstance(periods, list) else [], confidence)
+        return pv_slots_from_detailed(periods, confidence)
 
     def _load_by_hour(self) -> list[float] | None:
         mgr = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id)
@@ -269,8 +277,9 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
                     CONF_FORECAST_MARGIN_PCT, DEFAULT_FORECAST_MARGIN_PCT)) / 100.0,
             )
             prices = await self._prices()
+            pv = self._pv_by_slot()
             buckets = build_buckets(
-                time.time(), prices, self._pv_by_slot(), self._load_by_hour(),
+                time.time(), prices, pv, self._load_by_hour(),
                 horizon_h=ARBITRAGE_HORIZON_H,
             )
             plan = plan_arbitrage(buckets, bat, econ)
@@ -284,6 +293,10 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
                 "eta": eta, "eta_source": eta_src, "wear_ct": wear,
                 "eta_override": self.eta_override, **self._eta_detail,
                 "horizon_buckets": len(buckets),
+                # last PV slot the forecast covers — if the priced horizon runs past
+                # it, the planner is reading those hours as 0 W of sun
+                "pv_forecast_until": (dt_util.utc_from_timestamp(max(pv) + 900).isoformat()
+                                      if pv else None),
                 "enabled": self.enabled,
             }
         except Exception as err:  # noqa: BLE001 - advisory tick must never raise

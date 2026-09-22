@@ -214,6 +214,7 @@ class ArbitrageSensor(CoordinatorEntity, SensorEntity):
             "eta_source": data.get("eta_source"),
             "target_soc": data.get("target_soc"),
             "horizon_buckets": data.get("horizon_buckets"),
+            "pv_forecast_until": data.get("pv_forecast_until"),
         }
 
 

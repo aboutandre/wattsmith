@@ -32,6 +32,9 @@ FINDINGS (2026-09-22, 48 episodes x 7 days, eta 0.72, margin 15%):
   - eta MISMATCH (planner on the 0.80 seed, battery really 0.72): +EUR 8.77 / +7.23 on
     the two seed sets (~EUR 4-5/winter), 43% more energy bought. Bigger than the whole
     forecast-error gap — set eta_override / wire the measured eta (hel-121).
+  - TOMORROW'S PV INVISIBLE (reading only Solcast's forecast_today, hel-131, live until
+    v0.11.1): +EUR 9-14 over the sweep (1.3-1.8%), 13-25% more energy bought, almost
+    all in Oct/Feb/Mar when tomorrow has real sun. Simulate with pv_tomorrow=False.
 """
 from __future__ import annotations
 
@@ -258,9 +261,15 @@ class Result:
     spike_cost_ct: float
 
 
-def _pv_forecast(ep: Episode, t: int, k: int, confidence: str) -> float:
-    """What Solcast shows at time t for bucket k: intraday for today, day-ahead after."""
+def _pv_forecast(ep: Episode, t: int, k: int, confidence: str, tomorrow: bool = True) -> float:
+    """What Solcast shows at time t for bucket k: intraday for today, day-ahead after.
+
+    tomorrow=False reproduces reading only the forecast_today sensor (hel-131):
+    every bucket after midnight gets 0 W of PV.
+    """
     same_day = (k // DAY) == (t // DAY)
+    if not same_day and not tomorrow:
+        return 0.0
     p50 = ep.pv_id[k] if same_day else ep.pv_da[k]
     sd = PV_INTRADAY_SD if same_day else STRESS["pv_da_sd"]
     p10 = p50 * math.exp(-1.2816 * sd)
@@ -272,7 +281,8 @@ def _pv_forecast(ep: Episode, t: int, k: int, confidence: str) -> float:
 
 
 def simulate(ep: Episode, load_method: str = "mean", pv_confidence: str = "pessimistic",
-             oracle: bool = False, econ: Econ = ECON, true_eta: float | None = None) -> Result:
+             oracle: bool = False, econ: Econ = ECON, true_eta: float | None = None,
+             pv_tomorrow: bool = True) -> Result:
     """Rolling planner over the episode; decisions on forecasts, bill on actuals.
 
     `econ` is what the planner BELIEVES; `true_eta` (default: econ.eta) is what the
@@ -292,7 +302,7 @@ def simulate(ep: Episode, load_method: str = "mean", pv_confidence: str = "pessi
         if oracle:
             buckets = [Bucket(ep.price[k], ep.pv[k], ep.load[k]) for k in range(t, end)]
         else:
-            buckets = [Bucket(ep.price[k], _pv_forecast(ep, t, k, pv_confidence),
+            buckets = [Bucket(ep.price[k], _pv_forecast(ep, t, k, pv_confidence, pv_tomorrow),
                               hourly[(k % DAY) // 4] / 4.0) for k in range(t, end)]
         soc = MIN_SOC + 100.0 * e / CAP
         plan = plan_arbitrage(buckets, BatteryModel(soc, CAP, MIN_SOC, MAX_SOC, sc.CHARGE_W), econ)

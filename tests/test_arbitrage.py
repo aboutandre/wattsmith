@@ -304,6 +304,51 @@ def test_bigger_forecast_margin_earmarks_more():
     assert padded.grid_charge_now_wh >= lean.grid_charge_now_wh
 
 
+
+# ── hel-131: tomorrow's PV lives in a separate Solcast entity ────────────────
+def test_solcast_forecast_entities_adds_tomorrow_sibling():
+    assert a.solcast_forecast_entities("sensor.solcast_pv_forecast_forecast_today") == [
+        "sensor.solcast_pv_forecast_forecast_today",
+        "sensor.solcast_pv_forecast_forecast_tomorrow",
+    ]
+    assert a.solcast_forecast_entities("sensor.my_pv_forecast") == ["sensor.my_pv_forecast"]
+    assert a.solcast_forecast_entities("") == []
+
+
+def test_today_only_forecast_invents_a_need_tomorrow_afternoon():
+    """The live bug: at 15:00 the priced horizon reaches tomorrow, but reading only
+    the today-sensor leaves tomorrow's slots at 0 W — so a sunny afternoon shows up
+    as a deficit. With tomorrow's periods merged in, the need disappears."""
+    from datetime import datetime, timedelta, timezone
+    tz = timezone(timedelta(hours=2))
+    now = datetime(2026, 9, 22, 15, 0, tzinfo=tz)
+    prices = [((now + timedelta(minutes=15 * i)).timestamp(), 0.30) for i in range(33 * 4)]
+    for i in range(33 * 4):                    # dear tomorrow 14:00-18:00, cheap tonight
+        h = (now + timedelta(minutes=15 * i)).hour
+        day = (now + timedelta(minutes=15 * i)).day
+        if day == 23 and 14 <= h < 18:
+            prices[i] = (prices[i][0], 0.60)
+        elif h < 5:
+            prices[i] = (prices[i][0], 0.20)
+
+    def periods(day, kw):
+        base = datetime(2026, 9, day, 0, 0, tzinfo=tz)
+        return [{"period_start": (base + timedelta(minutes=30 * j)).isoformat(),
+                 "pv_estimate": kw if 16 <= j < 36 else 0.0} for j in range(48)]
+
+    today, tomorrow = periods(22, 2.0), periods(23, 2.0)       # 2 kW 08:00-18:00
+    load = [150.0] * 24                                         # 600 W flat
+    bat = BatteryModel(soc_pct=15.0, capacity_wh=15360.0, min_soc=13.0, max_soc=100.0,
+                       charge_power_w=7500.0)
+    econ = Econ(eta=0.75, wear_ct=3.26, min_margin_ct=1.5, forecast_margin_frac=0.0)
+
+    only_today = a.build_buckets(now.timestamp(), prices, a.pv_slots_from_detailed(today), load)
+    both = a.build_buckets(now.timestamp(), prices, a.pv_slots_from_detailed(today + tomorrow), load)
+    bad, good = plan_arbitrage(only_today, bat, econ), plan_arbitrage(both, bat, econ)
+    # tomorrow 14:00-18:00 is sunny: with the forecast there is nothing to buy for it
+    assert bad.profitable_deficit_wh > 0 and bad.next_need_price_ct == 60.0
+    assert good.next_need_price_ct != 60.0
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
