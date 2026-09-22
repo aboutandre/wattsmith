@@ -145,8 +145,23 @@ def test_calibration_overdue_charges_when_now_is_among_the_cheapest():
 def test_calibration_max_days_applies_without_a_drift_model():
     p = _plan({"a": _drift(None, 8.0)})
     assert p.status in ("grid_waiting", "grid_charging")
-    never = _plan({"a": sd.BatteryDrift("a", None, 0.0, None)})
+    now = 100 * 86400.0
+    # not full anywhere in 10 days of history -> genuinely overdue
+    never = _plan({"a": sd.BatteryDrift("a", None, 0.0, None, now - 10 * 86400.0)})
     assert never.status in ("grid_waiting", "grid_charging")
+    # ...but only 2 days of history is not evidence of 7 days without a full charge
+    short = _plan({"a": sd.BatteryDrift("a", None, 0.0, None, now - 2 * 86400.0)})
+    assert short.status == "ok"
+
+
+def test_no_history_is_unknown_not_overdue():
+    """Regression (v0.12.0 on live HA): right after a restart the history DB is not
+    up yet, the first tick saw no rows, read that as "never full" and scheduled a
+    grid top-up for batteries that had been full two hours earlier."""
+    assert _plan({"a": sd.BatteryDrift("a", None, 0.0, None)}).status == "ok"
+    d = sd.battery_drift_now([], {}, None, {"a": 95.0}, 100 * 86400.0)["a"]
+    assert d.last_full_ts is None and d.covered_since_ts is None
+    assert _plan(sd.battery_drift_now([], {}, None, {"a": 95.0}, 100 * 86400.0)).status == "ok"
 
 
 def test_calibration_grid_off_or_disabled():

@@ -158,6 +158,10 @@ class BatteryDrift:
     last_full_ts: float | None    # None: not full anywhere in the rows given
     discharged_wh: float          # since the last full charge
     predicted_pts: float | None   # expected under-reading now (None: no drift model)
+    # earliest history the answer rests on. With last_full_ts None this says
+    # "not full for at least this long"; None too means NO DATA — unknown, which
+    # must never be read as "never full" (a restart race did exactly that).
+    covered_since_ts: float | None = None
 
 
 def battery_drift_now(
@@ -180,15 +184,17 @@ def battery_drift_now(
             out[bid] = BatteryDrift(bid, now_ts, 0.0, 0.0)
             continue
         bat_rows = by.get(bid, [])
+        covered = float(bat_rows[0]["ts_start"]) if bat_rows else None
         last = max((i for i, r in enumerate(bat_rows) if r["soc_end"] >= FULL_SOC), default=None)
         if last is None:
-            out[bid] = BatteryDrift(bid, None, 0.0, None)
+            out[bid] = BatteryDrift(bid, None, 0.0, None, covered)
             continue
         since = bat_rows[last + 1:]
         discharged = sum(r.get("discharge_wh") or 0.0 for r in since)
         fit = fits.get(bid) or fleet_fit
         predicted = fit.pts_per_kwh * discharged / 1000.0 if fit else None
-        out[bid] = BatteryDrift(bid, bat_rows[last]["ts_start"] + BUCKET_S, discharged, predicted)
+        out[bid] = BatteryDrift(bid, bat_rows[last]["ts_start"] + BUCKET_S, discharged, predicted,
+                                covered)
     return out
 
 
@@ -226,10 +232,15 @@ def plan_calibration(
         return CalibrationPlan("off", False, False, (), "calibration disabled")
 
     def days(d: BatteryDrift) -> float:
-        return math.inf if d.last_full_ts is None else (now_ts - d.last_full_ts) / 86400.0
+        if d.last_full_ts is not None:
+            return (now_ts - d.last_full_ts) / 86400.0
+        # not full anywhere in the history: at least as long as the history reaches
+        return (now_ts - d.covered_since_ts) / 86400.0
 
     due, overdue = [], []
     for bid, d in sorted(drift.items()):
+        if d.last_full_ts is None and d.covered_since_ts is None:
+            continue                     # no data about this battery: unknown, not due
         pts = d.predicted_pts
         is_due = days(d) >= max_days or (pts is not None and pts >= threshold_pts)
         if is_due:

@@ -211,10 +211,15 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         states = self.bridge.read_all()
         import time
         now = time.time()
-        rows = []
-        if query is not None:
-            rows = await query(int(now - DRIFT_STATE_DAYS * 86400), int(now),
-                               table="battery_bucket", limit=DRIFT_STATE_DAYS * 96 * 16)
+        if query is None:
+            # history DB not up yet (it starts after us) or disabled: we cannot know
+            # when the batteries were last full, so decide nothing rather than guess
+            self._calibration = None
+            return {"calibration_status": "unknown",
+                    "calibration_reason": "history DB not available yet",
+                    "calibration_batteries": {}}
+        rows = await query(int(now - DRIFT_STATE_DAYS * 86400), int(now),
+                           table="battery_bucket", limit=DRIFT_STATE_DAYS * 96 * 16)
         drift = battery_drift_now(rows, self._drift_fits, self._fleet_drift,
                                   {s.battery_id: s.soc for s in states}, now)
         per_bucket = bat.charge_power_w * 0.25
