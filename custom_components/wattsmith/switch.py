@@ -10,8 +10,15 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_ADAPTIVE_ENABLED, CONF_ARBITRAGE_ENABLED, DOMAIN
+from .const import (
+    CONF_ADAPTIVE_ENABLED,
+    CONF_ARBITRAGE_ENABLED,
+    CONF_CALIBRATION_ENABLED,
+    CONF_CALIBRATION_GRID,
+    DOMAIN,
+)
 from .manager import EnergyManagerCoordinator
+from .settings import DEFAULT_CALIBRATION_ENABLED, DEFAULT_CALIBRATION_GRID
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,6 +37,12 @@ async def async_setup_entry(
     arb = hass.data[DOMAIN].get(entry.entry_id + "_arb")
     if arb is not None:
         switches.append(ArbitrageEnableSwitch(arb, entry))
+        switches.append(OptionSwitch(
+            arb, entry, CONF_CALIBRATION_ENABLED, DEFAULT_CALIBRATION_ENABLED,
+            "SOC Calibration", "mdi:battery-sync"))
+        switches.append(OptionSwitch(
+            arb, entry, CONF_CALIBRATION_GRID, DEFAULT_CALIBRATION_GRID,
+            "SOC Calibration Grid Top-Up", "mdi:transmission-tower-import"))
     async_add_entities(switches)
 
 
@@ -135,6 +148,48 @@ class ArbitrageEnableSwitch(CoordinatorEntity, SwitchEntity):
 
     async def _set(self, value: bool) -> None:
         new_options = {**self._entry.options, CONF_ARBITRAGE_ENABLED: value}
+        self.hass.config_entries.async_update_entry(self._entry, options=new_options)
+        await self.coordinator.async_request_refresh()
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self._set(True)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._set(False)
+
+
+class OptionSwitch(CoordinatorEntity, SwitchEntity):
+    """A boolean option on the manager device, read live by the arbitrage coordinator.
+
+    SOC Calibration (hel-134): a full charge whenever a battery's predicted SOC
+    drift gets too large, so the BMS resets its count. Grid Top-Up lets it finish
+    from the cheapest grid window when PV has not managed it (needs Arbitrage Control).
+    """
+
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator, entry: ConfigEntry, key: str, default: bool,
+                 name: str, icon: str) -> None:
+        super().__init__(coordinator)
+        self._entry = entry
+        self._key = key
+        self._default = default
+        self._attr_unique_id = f"{entry.entry_id}_{key}"
+        self._attr_name = name
+        self._attr_icon = icon
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": entry.title,
+            "manufacturer": "Wattsmith",
+            "model": "Energy Brain",
+        }
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self._entry.options.get(self._key, self._default))
+
+    async def _set(self, value: bool) -> None:
+        new_options = {**self._entry.options, self._key: value}
         self.hass.config_entries.async_update_entry(self._entry, options=new_options)
         await self.coordinator.async_request_refresh()
 

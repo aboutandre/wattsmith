@@ -93,19 +93,29 @@ DEFAULT_EXPORT_PRICE: Final[float] = 0.07        # feed-in tariff EUR/kWh (oppor
 # Per-battery cost/cycles are configurable; these seed the fleet default.
 DEFAULT_BATTERY_COST_EUR: Final[float] = 1000.0
 DEFAULT_EXPECTED_CYCLES: Final[int] = 6000
-# Round-trip efficiency. The arbitrage coordinator MEASURES it from the history DB
-# (battery_bucket, contiguous charge-/discharge-only runs per battery) over a
-# rolling window, so it follows the season; the UI override (number entity /
-# options flow) wins over the measurement. The SEED is only the fallback until the
-# DB holds enough swing — set from the fleet's own 07-09/2026 history (0.751;
-# charge leg ~0.93, discharge leg ~0.80 at house-load power). The old 0.80 came
-# from third-party bench tests and over-stated it.
-DEFAULT_ETA_SEED: Final[float] = 0.75
-ETA_MIN_DSOC: Final[float] = 8.0                 # min total SOC swing per direction to trust
-ETA_RUN_MIN_DSOC: Final[float] = 5.0             # shorter runs are integer-SOC noise
-ETA_WINDOW_DAYS: Final[int] = 30                 # rolling measurement window
-ETA_REFRESH_S: Final[float] = 6 * 3600.0         # re-measure this often (η drifts slowly)
+# Round-trip efficiency. The arbitrage coordinator measures it between full-charge
+# resets (soc_drift.fit_eta_standby): the BMS SOC drifts, so only windows that start
+# and end at a BMS-calibrated 100% give an exact energy balance (hel-133). Marginal
+# η on 07-09/2026 = 0.80-0.82 plus ~10 W standby per battery; the UI override wins.
+DEFAULT_ETA_SEED: Final[float] = 0.80
+ETA_REFRESH_S: Final[float] = 6 * 3600.0         # re-fit η + drift rates this often
 ETA_VALID_RANGE: Final[tuple[float, float]] = (0.55, 0.97)  # outside -> reject, keep fallback
+ETA_MIN_WINDOWS: Final[int] = 6                  # full-to-full windows before η is trusted
+DRIFT_HISTORY_DAYS: Final[int] = 90              # history the fits look back over
+DRIFT_STATE_DAYS: Final[int] = 15                # "since last full" lookback per tick
+DRIFT_MIN_WINDOWS: Final[int] = 4                # resets per battery before its own rate is used
+
+# SOC calibration (hel-134). A battery is due once its PREDICTED drift reaches the
+# threshold (learned per battery: points per kWh discharged since its last full
+# charge; ~1.3 on this fleet, i.e. ~3 days) or after max days. Due opens the charge
+# ceiling to 100% for PV; if PV has not managed it by threshold + grid extra, the
+# fleet tops up from the grid in the cheapest buckets (needs Arbitrage Control on).
+DEFAULT_CALIBRATION_ENABLED: Final[bool] = True
+DEFAULT_CALIBRATION_THRESHOLD_PTS: Final[float] = 8.0
+DEFAULT_CALIBRATION_MAX_DAYS: Final[float] = 7.0
+DEFAULT_CALIBRATION_GRID: Final[bool] = True
+CALIBRATION_GRID_EXTRA_PTS: Final[float] = 4.0
+CALIBRATION_LOOKAHEAD_BUCKETS: Final[int] = 96   # cheapest window searched within 24 h
 DEFAULT_MIN_ARBITRAGE_MARGIN_CT: Final[float] = 1.5   # skip sub-margin churn
 # Plan against the mean of Solcast's central and p10 estimates: missing a deficit
 # costs a peak-price import, overshooting costs only the spread plus wear.

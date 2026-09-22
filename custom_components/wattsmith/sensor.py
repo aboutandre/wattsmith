@@ -75,6 +75,7 @@ ARBITRAGE_SENSORS: tuple[tuple[str, str, str | None, str | None, str], ...] = (
     ("hold_floor_soc", "Arbitrage Discharge Hold SOC", "%", "battery", "mdi:battery-lock"),
     ("eta", "Round-Trip Efficiency", "%", None, "mdi:sync"),
     ("wear_ct", "Battery Wear Cost", None, None, "mdi:battery-heart-variant"),
+    ("calibration_status", "SOC Calibration", None, None, "mdi:battery-sync"),
 )
 
 # Adaptive PV charging sub-keys (read from coordinator.data["adaptive"]).
@@ -133,6 +134,8 @@ class ManagerSensor(CoordinatorEntity, SensorEntity):
             "excluded_batteries": data.get("excluded_batteries", {}),
             # True while actively importing from the grid to charge for arbitrage
             "arbitrage_charging": data.get("arb_charging", False),
+            # True while a SOC-calibration full charge has lifted the ceiling to 100%
+            "calibrating": data.get("calibrating", False),
         }
 
 
@@ -194,6 +197,13 @@ class ArbitrageSensor(CoordinatorEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         data = self.coordinator.data or {}
+        if self._key == "calibration_status":
+            return {
+                "reason": data.get("calibration_reason"),
+                # per battery (last 4 of id): days since full, kWh discharged since,
+                # predicted SOC under-reading and the learned drift rate
+                "batteries": data.get("calibration_batteries"),
+            }
         if self._key == "eta":
             # value = what the planner USES; these say where it came from
             pct = lambda v: round(v * 100.0, 1) if v is not None else None  # noqa: E731
@@ -202,8 +212,8 @@ class ArbitrageSensor(CoordinatorEntity, SensorEntity):
                 "measured": pct(data.get("eta_measured")),
                 "measured_valid": data.get("eta_measured_valid"),
                 "override": pct(data.get("eta_override")),
-                "charge_soc_swing_pct": data.get("eta_charge_soc_pct"),
-                "discharge_soc_swing_pct": data.get("eta_discharge_soc_pct"),
+                "standby_w_per_battery": data.get("eta_standby_w"),
+                "full_to_full_windows": data.get("eta_windows"),
                 "window_days": data.get("eta_window_days"),
                 "measured_at": data.get("eta_measured_at"),
             }

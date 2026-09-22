@@ -23,6 +23,8 @@ from .const import (
     CONF_ADAPTIVE_FORECAST_DERATE,
     CONF_BRIDGE_FLOOR_SOC,
     CONF_BRIDGE_GRACE_S,
+    CONF_CALIBRATION_MAX_DAYS,
+    CONF_CALIBRATION_THRESHOLD_PTS,
     CONF_CHEAP_PRICE_THRESHOLD,
     CONF_DEADBAND_W,
     CONF_DIRECTION_HYSTERESIS_W,
@@ -42,6 +44,8 @@ from .const import (
 from .settings import (
     DEFAULT_BRIDGE_FLOOR_SOC,
     DEFAULT_BRIDGE_GRACE_S,
+    DEFAULT_CALIBRATION_MAX_DAYS,
+    DEFAULT_CALIBRATION_THRESHOLD_PTS,
     DEFAULT_CHEAP_PRICE_THRESHOLD,
     DEFAULT_FORECAST_MARGIN_PCT,
     DEFAULT_MAX_BATTERY_SOC,
@@ -127,6 +131,16 @@ NUMBERS: tuple[ManagerNumber, ...] = (
                   "mdi:cloud-percent",
                   lambda c: float(c.entry.options.get(CONF_FORECAST_MARGIN_PCT,
                                                       DEFAULT_FORECAST_MARGIN_PCT))),
+    # SOC calibration (hel-134), read live by the arbitrage coordinator: a battery is
+    # due when its predicted SOC under-reading reaches the threshold, or after max days
+    ManagerNumber(CONF_CALIBRATION_THRESHOLD_PTS, "Calibration Drift Threshold", 2, 30, 1, "%",
+                  "mdi:battery-sync-outline",
+                  lambda c: float(c.entry.options.get(CONF_CALIBRATION_THRESHOLD_PTS,
+                                                      DEFAULT_CALIBRATION_THRESHOLD_PTS))),
+    ManagerNumber(CONF_CALIBRATION_MAX_DAYS, "Calibration Max Interval", 1, 30, 1, "d",
+                  "mdi:calendar-sync",
+                  lambda c: float(c.entry.options.get(CONF_CALIBRATION_MAX_DAYS,
+                                                      DEFAULT_CALIBRATION_MAX_DAYS))),
 )
 
 

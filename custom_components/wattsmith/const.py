@@ -94,3 +94,9 @@ CONF_MIN_ARBITRAGE_MARGIN_CT: Final = "min_arbitrage_margin_ct"
 CONF_IMPORT_POWER_CAP_W: Final = "import_power_cap_w"   # 0 = no cap
 CONF_ARBITRAGE_PV_CONFIDENCE: Final = "arbitrage_pv_confidence"  # central|blend|pessimistic
 CONF_FORECAST_MARGIN_PCT: Final = "forecast_margin_pct"  # pad on the forecast deficit
+
+# SOC calibration (hel-134): the BMS SOC drifts below reality until a full charge
+CONF_CALIBRATION_ENABLED: Final = "calibration_enabled"
+CONF_CALIBRATION_THRESHOLD_PTS: Final = "calibration_threshold_pts"  # predicted drift that makes it due
+CONF_CALIBRATION_MAX_DAYS: Final = "calibration_max_days"            # safety net: due after this many days
+CONF_CALIBRATION_GRID: Final = "calibration_grid"                    # allow a grid top-up when PV fails

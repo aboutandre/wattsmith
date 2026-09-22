@@ -120,6 +120,8 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         self._last_baseline_save: float = 0.0    # monotonic; save at most hourly
         # Latest adaptive decision (published for the Adaptive entities).
         self._adaptive: AdaptiveResult | None = None
+        # True while a calibration full charge is lifting the ceiling (published on status).
+        self._calibrating = False
         # True while actively grid-charging for arbitrage (published on status).
         self._arb_charging: bool = False
 
@@ -242,6 +244,11 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         """Arbitrage discharge-hold floor (only when the Arbitrage switch is on)."""
         arb = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_arb")
         return getattr(arb, "hold_floor_soc", None)
+
+    def _arb_calibration_open_ceiling(self) -> bool:
+        """True while the arbitrage coordinator says a calibration charge is due."""
+        arb = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_arb")
+        return bool(getattr(arb, "calibration_open_ceiling", False))
 
     def _arb_charge_target_soc(self) -> float | None:
         """Grid-charge target SOC for THIS bucket, or None.
@@ -524,6 +531,13 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             # disabled / no data / sun down.
             self._adaptive = self._eval_adaptive(states)
             self.planner.config.max_battery_soc = self._adaptive.effective_max_soc
+            # SOC calibration (hel-134): the BMS SOC drifts below reality until the
+            # battery is really full, so when a calibration is due the ceiling goes
+            # to 100% and PV (or a scheduled grid top-up) finishes the job. The EV
+            # right-of-way below still applies — the car keeps first claim on PV.
+            self._calibrating = self._arb_calibration_open_ceiling()
+            if self._calibrating:
+                self.planner.config.max_battery_soc = 100.0
             # EV solar-charging right-of-way: hold batteries at reserve SOC so
             # they don't compete with the car for the same PV watts.
             ev_reserve = self._ev_solar_reserve_soc()
@@ -600,6 +614,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             "stalled_ids": plan.stalled_ids,
             "excluded_batteries": plan.excluded,
             "arb_charging": self._arb_charging,
+            "calibrating": self._calibrating,
             "safety": self.supervisor.status(now),
             "target_grid_w": self.controller.config.target_grid_w,
             "adaptive": self._adaptive_status(),
