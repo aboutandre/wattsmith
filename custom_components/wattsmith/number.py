@@ -13,6 +13,7 @@ from typing import Callable
 from homeassistant.components.number import NumberEntity, NumberMode
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -25,6 +26,7 @@ from .const import (
     CONF_CHEAP_PRICE_THRESHOLD,
     CONF_DEADBAND_W,
     CONF_DIRECTION_HYSTERESIS_W,
+    CONF_ETA_OVERRIDE,
     CONF_FORECAST_MARGIN_PCT,
     CONF_KD,
     CONF_KP,
@@ -47,6 +49,8 @@ from .settings import (
     DEFAULT_PHASE_UP_W,
     DEFAULT_RESERVE_SOC,
 )
+from .arbitrage_coordinator import ArbitrageCoordinator
+from .economics import parse_eta_override
 from .ev_coordinator import EvCoordinator
 from .manager import EnergyManagerCoordinator
 
@@ -139,6 +143,9 @@ async def async_setup_entry(
     ev_coord: EvCoordinator | None = hass.data[DOMAIN].get(entry.entry_id + "_ev")
     if ev_coord is not None:
         entities.extend(EvNumberEntity(ev_coord, entry, d) for d in EV_NUMBERS)
+    arb: ArbitrageCoordinator | None = hass.data[DOMAIN].get(entry.entry_id + "_arb")
+    if arb is not None:
+        entities.append(EtaOverrideNumber(arb, entry))
     async_add_entities(entities)
 
 
@@ -224,4 +231,49 @@ class EvNumberEntity(CoordinatorEntity, NumberEntity):
         self.hass.config_entries.async_update_entry(
             self.coordinator.entry, options=new_options
         )
+        await self.coordinator.async_request_refresh()
+
+
+class EtaOverrideNumber(CoordinatorEntity, NumberEntity):
+    """Round-trip efficiency override — 0 = auto (measured from the history DB).
+
+    Writes the same `eta_override` option as the Economics options step (stored as
+    a fraction), so the two UIs can never disagree.
+    """
+
+    _attr_has_entity_name = True
+    _attr_mode = NumberMode.BOX
+    _attr_name = "Round-Trip Efficiency Override"
+    _attr_icon = "mdi:sync-alert"
+    _attr_native_min_value = 0
+    _attr_native_max_value = 100
+    _attr_native_step = 0.5
+    _attr_native_unit_of_measurement = "%"
+
+    def __init__(self, coordinator: ArbitrageCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._entry = entry
+        self._attr_unique_id = f"{entry.entry_id}_{CONF_ETA_OVERRIDE}"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, entry.entry_id)},
+            "name": entry.title,
+            "manufacturer": "Wattsmith",
+            "model": "Energy Brain",
+        }
+
+    @property
+    def native_value(self) -> float:
+        v = parse_eta_override(self._entry.options.get(CONF_ETA_OVERRIDE))
+        return round(v * 100.0, 1) if v is not None else 0.0
+
+    async def async_set_native_value(self, value: float) -> None:
+        options = dict(self._entry.options)
+        if value <= 0:
+            options.pop(CONF_ETA_OVERRIDE, None)          # back to auto
+        elif value < 50:
+            raise HomeAssistantError(
+                "Round-trip efficiency override must be 0 (auto) or 50-100 %")
+        else:
+            options[CONF_ETA_OVERRIDE] = round(value / 100.0, 4)
+        self.hass.config_entries.async_update_entry(self._entry, options=options)
         await self.coordinator.async_request_refresh()

@@ -114,6 +114,65 @@ def estimate_round_trip_eta(
     )
 
 
+def eta_segments_from_buckets(
+    rows: list[dict],
+    min_run_dsoc: float = 5.0,
+    bucket_s: int = 900,
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Per-battery history rows -> (charge_segments, discharge_segments) for η.
+
+    Each row is a battery_bucket dict: ts_start, battery_id, charge_wh,
+    discharge_wh, soc_start, soc_end. A segment is one CONTIGUOUS run of
+    charge-only (or discharge-only) buckets of one battery: (ac_wh, |dsoc|),
+    with dsoc taken end-to-end across the run.
+
+    Runs, not buckets: SOC is an integer, so a bucket can charge without its SOC
+    ticking. Keeping only buckets whose SOC moved (what estimate_round_trip_eta
+    does with ds > 0) drops that energy and inflates η — on the 2026 history it
+    read 0.84 instead of the true 0.75. Across a run the ticks telescope, and
+    runs under `min_run_dsoc` are skipped as quantisation noise.
+    """
+    def mode(r: dict) -> str:
+        c, d = r.get("charge_wh") or 0.0, r.get("discharge_wh") or 0.0
+        if c > 20.0 and d < 2.0:
+            return "c"
+        if d > 20.0 and c < 2.0:
+            return "d"
+        return "x"
+
+    by_battery: dict[str, list[dict]] = {}
+    for r in rows:
+        if r.get("soc_start") is None or r.get("soc_end") is None:
+            continue
+        by_battery.setdefault(r.get("battery_id"), []).append(r)
+
+    charge: list[tuple[float, float]] = []
+    discharge: list[tuple[float, float]] = []
+
+    def close(run: list[dict]) -> None:
+        if not run:
+            return
+        m = mode(run[0])
+        if m == "x":
+            return
+        dsoc = abs(run[-1]["soc_end"] - run[0]["soc_start"])
+        if dsoc < min_run_dsoc:
+            return
+        key = "charge_wh" if m == "c" else "discharge_wh"
+        (charge if m == "c" else discharge).append((sum(r[key] for r in run), dsoc))
+
+    for bat_rows in by_battery.values():
+        bat_rows.sort(key=lambda r: r["ts_start"])
+        run: list[dict] = []
+        for r in bat_rows:
+            if run and (mode(r) != mode(run[-1]) or r["ts_start"] - run[-1]["ts_start"] != bucket_s):
+                close(run)
+                run = []
+            run.append(r)
+        close(run)
+    return charge, discharge
+
+
 def fleet_wear_cost_ct(per_battery: list[tuple[float, float, float]]) -> float | None:
     """Capacity-weighted fleet wear cost from [(cost_eur, cycles, cap_wh), ...]."""
     num = den = 0.0
@@ -123,3 +182,22 @@ def fleet_wear_cost_ct(per_battery: list[tuple[float, float, float]]) -> float |
             num += w * cap
             den += cap
     return num / den if den > 0 else None
+
+
+def parse_eta_override(raw: object) -> float | None:
+    """Normalise a stored η override to a fraction, or None for "auto".
+
+    Blank / None / 0 mean "use the measurement". Values above 1.5 are read as a
+    percentage (74 -> 0.74) so a slip between the two UIs can't produce η = 74.
+    """
+    if raw in (None, ""):
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    if v > 1.5:
+        v /= 100.0
+    return v if 0.0 < v <= 1.0 else None

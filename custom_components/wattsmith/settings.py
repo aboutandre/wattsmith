@@ -93,14 +93,19 @@ DEFAULT_EXPORT_PRICE: Final[float] = 0.07        # feed-in tariff EUR/kWh (oppor
 # Per-battery cost/cycles are configurable; these seed the fleet default.
 DEFAULT_BATTERY_COST_EUR: Final[float] = 1000.0
 DEFAULT_EXPECTED_CYCLES: Final[int] = 6000
-# Round-trip efficiency: SEED for the self-measuring estimator. Independent
-# hands-on measurements of the Venus E 3.0 (metered, incl. dual AC conversion +
-# standby) put real-world RTE at ~80-84%; we seed at the conservative 0.80. The
-# 78% June figure was measured at trickle only, so it flattered the charge leg.
-# Override per-install via the eta_override option; sharpens once real
-# high-power discharge data + the DB estimator are wired.
-DEFAULT_ETA_SEED: Final[float] = 0.80
-ETA_MIN_DSOC: Final[float] = 8.0                 # min SOC swing for a usable η segment
+# Round-trip efficiency. The arbitrage coordinator MEASURES it from the history DB
+# (battery_bucket, contiguous charge-/discharge-only runs per battery) over a
+# rolling window, so it follows the season; the UI override (number entity /
+# options flow) wins over the measurement. The SEED is only the fallback until the
+# DB holds enough swing — set from the fleet's own 07-09/2026 history (0.751;
+# charge leg ~0.93, discharge leg ~0.80 at house-load power). The old 0.80 came
+# from third-party bench tests and over-stated it.
+DEFAULT_ETA_SEED: Final[float] = 0.75
+ETA_MIN_DSOC: Final[float] = 8.0                 # min total SOC swing per direction to trust
+ETA_RUN_MIN_DSOC: Final[float] = 5.0             # shorter runs are integer-SOC noise
+ETA_WINDOW_DAYS: Final[int] = 30                 # rolling measurement window
+ETA_REFRESH_S: Final[float] = 6 * 3600.0         # re-measure this often (η drifts slowly)
+ETA_VALID_RANGE: Final[tuple[float, float]] = (0.55, 0.97)  # outside -> reject, keep fallback
 DEFAULT_MIN_ARBITRAGE_MARGIN_CT: Final[float] = 1.5   # skip sub-margin churn
 # Plan against the mean of Solcast's central and p10 estimates: missing a deficit
 # costs a peak-price import, overshooting costs only the spread plus wear.

@@ -39,7 +39,13 @@ from .const import (
     CONF_WEAR_COST_CT,
     DOMAIN,
 )
-from .economics import fleet_wear_cost_ct, wear_cost_ct_per_kwh
+from .economics import (
+    eta_segments_from_buckets,
+    estimate_round_trip_eta,
+    fleet_wear_cost_ct,
+    parse_eta_override,
+    wear_cost_ct_per_kwh,
+)
 from .settings import (
     ARBITRAGE_HORIZON_H,
     DEFAULT_ARBITRAGE_PV_CONFIDENCE,
@@ -51,6 +57,11 @@ from .settings import (
     DEFAULT_MAX_BATTERY_POWER,
     DEFAULT_MIN_ARBITRAGE_MARGIN_CT,
     DEFAULT_MIN_SOC,
+    ETA_MIN_DSOC,
+    ETA_REFRESH_S,
+    ETA_RUN_MIN_DSOC,
+    ETA_VALID_RANGE,
+    ETA_WINDOW_DAYS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -69,6 +80,9 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         self.entry = entry
         self.bridge = BatteryBridge(hass)
         self._measured_eta: float | None = None
+        # last measurement from the history DB (None until the first one lands)
+        self._eta_measured_at: float | None = None
+        self._eta_detail: dict[str, Any] = {}
 
     # ---- public surface (read by the manager, gated by the switch) ------
     @property
@@ -92,14 +106,58 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
     def set_measured_eta(self, eta: float | None) -> None:
         self._measured_eta = eta
 
+    @property
+    def eta_override(self) -> float | None:
+        """The UI/options override as a fraction, or None (= use the measurement)."""
+        return parse_eta_override(self.entry.options.get(CONF_ETA_OVERRIDE))
+
     # ---- economics inputs ----------------------------------------------
     def _eta(self) -> tuple[float, str]:
-        override = self.entry.options.get(CONF_ETA_OVERRIDE)
-        if override not in (None, ""):
-            return float(override), "override"
+        override = self.eta_override
+        if override is not None:
+            return override, "override"
         if self._measured_eta is not None:
             return self._measured_eta, "measured"
         return DEFAULT_ETA_SEED, "seed"
+
+    async def _async_measure_eta(self) -> None:
+        """Re-measure round-trip η from the history DB's per-battery buckets.
+
+        Contiguous charge-/discharge-only runs over a rolling window (see
+        economics.eta_segments_from_buckets for why runs, not buckets). Keeps the
+        previous value on thin data or an implausible result, and never raises.
+        """
+        recorder = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_history")
+        query = getattr(recorder, "async_query_range", None)
+        if not callable(query):
+            return                      # DB not up yet (starts after us) or disabled
+        import time
+        now = time.time()
+        self._eta_measured_at = now     # a failed attempt waits for the next refresh too
+        try:
+            rows = await query(int(now - ETA_WINDOW_DAYS * 86400), int(now),
+                               table="battery_bucket", limit=ETA_WINDOW_DAYS * 96 * 16)
+            charge, discharge = eta_segments_from_buckets(rows, min_run_dsoc=ETA_RUN_MIN_DSOC)
+            res = estimate_round_trip_eta(charge, discharge, seed=DEFAULT_ETA_SEED,
+                                          min_total_dsoc=ETA_MIN_DSOC)
+        except Exception as err:  # noqa: BLE001 - measurement must never break the tick
+            _LOGGER.warning("arbitrage: η measurement failed: %s", err)
+            return
+        lo, hi = ETA_VALID_RANGE
+        valid = res.measured and lo <= res.eta <= hi
+        self._eta_detail = {
+            "eta_measured": round(res.eta, 4) if res.measured else None,
+            "eta_measured_valid": valid,
+            "eta_charge_soc_pct": round(sum(ds for _wh, ds in charge), 1),
+            "eta_discharge_soc_pct": round(sum(ds for _wh, ds in discharge), 1),
+            "eta_window_days": ETA_WINDOW_DAYS,
+            "eta_measured_at": dt_util.utc_from_timestamp(now).isoformat(),
+        }
+        if valid:
+            self._measured_eta = res.eta
+        elif res.measured:
+            _LOGGER.warning("arbitrage: measured η %.3f outside %s — keeping %s",
+                            res.eta, ETA_VALID_RANGE, self._measured_eta or DEFAULT_ETA_SEED)
 
     def _wear_ct(self) -> float:
         configured = self.entry.options.get(CONF_WEAR_COST_CT)
@@ -194,6 +252,8 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
     # ---- the (advisory) tick -------------------------------------------
     async def _async_update_data(self) -> dict[str, Any]:
         import time
+        if self._eta_measured_at is None or time.time() - self._eta_measured_at >= ETA_REFRESH_S:
+            await self._async_measure_eta()
         try:
             bat = self._fleet_model()
             if bat is None:
@@ -222,6 +282,7 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
                 "profitable_deficit_wh": plan.profitable_deficit_wh,
                 "reason": plan.reason,
                 "eta": eta, "eta_source": eta_src, "wear_ct": wear,
+                "eta_override": self.eta_override, **self._eta_detail,
                 "horizon_buckets": len(buckets),
                 "enabled": self.enabled,
             }
@@ -234,6 +295,7 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
             "grid_charge_now_wh": 0.0, "target_soc": None, "hold_floor_soc": None,
             "profitable_deficit_wh": 0.0, "reason": reason,
             "eta": None, "eta_source": None, "wear_ct": None,
+            "eta_override": self.eta_override, **self._eta_detail,
             "horizon_buckets": 0, "enabled": self.enabled,
         }
 

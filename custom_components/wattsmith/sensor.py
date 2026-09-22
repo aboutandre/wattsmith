@@ -73,7 +73,7 @@ ARBITRAGE_SENSORS: tuple[tuple[str, str, str | None, str | None, str], ...] = (
     ("grid_charge_now_wh", "Arbitrage Grid Charge Now", "Wh", "energy", "mdi:transmission-tower-import"),
     ("profitable_deficit_wh", "Arbitrage Profitable Deficit", "Wh", "energy", "mdi:cash-plus"),
     ("hold_floor_soc", "Arbitrage Discharge Hold SOC", "%", "battery", "mdi:battery-lock"),
-    ("eta", "Round-Trip Efficiency", None, None, "mdi:sync"),
+    ("eta", "Round-Trip Efficiency", "%", None, "mdi:sync"),
     ("wear_ct", "Battery Wear Cost", None, None, "mdi:battery-heart-variant"),
 )
 
@@ -193,9 +193,22 @@ class ArbitrageSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
+        data = self.coordinator.data or {}
+        if self._key == "eta":
+            # value = what the planner USES; these say where it came from
+            pct = lambda v: round(v * 100.0, 1) if v is not None else None  # noqa: E731
+            return {
+                "source": data.get("eta_source"),          # measured | override | seed
+                "measured": pct(data.get("eta_measured")),
+                "measured_valid": data.get("eta_measured_valid"),
+                "override": pct(data.get("eta_override")),
+                "charge_soc_swing_pct": data.get("eta_charge_soc_pct"),
+                "discharge_soc_swing_pct": data.get("eta_discharge_soc_pct"),
+                "window_days": data.get("eta_window_days"),
+                "measured_at": data.get("eta_measured_at"),
+            }
         if self._key != "reason":
             return None
-        data = self.coordinator.data or {}
         return {
             "enabled": data.get("enabled"),
             "eta_source": data.get("eta_source"),
