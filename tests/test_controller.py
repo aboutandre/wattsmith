@@ -129,6 +129,101 @@ def test_convergence_to_target():
     assert abs(grid - (-50)) < 60
 
 
+
+# ── pulse hold (hel-136) ─────────────────────────────────────────────────────
+def _pulse_ctrl(hold=True):
+    c = ZeroGridController(ControllerConfig())
+    c.config.pulse_hold = hold
+    return c
+
+
+def _feed(c, grids, bats, t0=0.0, dt=5.0):
+    out = None
+    for i, g in enumerate(grids):
+        out = c.update(g, bats, now=t0 + i * dt)
+    return out
+
+
+def test_pulsing_load_is_detected_and_held_at_the_peak():
+    c = _pulse_ctrl()
+    bats = _bats([60, 60, 60])
+    # a load flipping +1000 / -1000 W around the target every sample
+    _feed(c, [1000, -1000, 1000, -1000, 1000, -1000], bats)
+    assert c.pulsing
+    assert c.hold_floor_w > 0
+    held = c._command_total
+    c.update(-1000, bats, now=31.0)           # an off-pulse: would normally cut back 800 W
+    assert c._command_total >= held - 1       # held, not chased
+
+
+def test_pulse_hold_off_chases_the_load_as_before():
+    c = _pulse_ctrl(hold=False)
+    bats = _bats([60, 60, 60])
+    _feed(c, [1000, -1000, 1000, -1000, 1000, -1000], bats)
+    assert c.pulsing and c.hold_floor_w == 0.0      # still detected, but not acted on
+
+
+def test_a_single_load_drop_is_not_pulsing():
+    c = _pulse_ctrl()
+    bats = _bats([60, 60, 60])
+    _feed(c, [1500, 800, 0, -900, -60, -60], bats)  # kettle on, then off: no reversals
+    assert not c.pulsing and c.hold_floor_w == 0.0
+
+
+def test_pulse_hold_never_blocks_pv_charging():
+    c = _pulse_ctrl()
+    bats = _bats([60, 60, 60])
+    c._command_total = -2000.0                       # charging from a PV surplus
+    # pulses riding on the surplus: demand stays negative the whole time
+    _feed(c, [-1500, -2500, -1500, -2500, -1500, -2500], bats)
+    assert c.hold_floor_w == 0.0                      # nothing to hold: no discharge needed
+    assert c._command_total < 0                       # still charging
+
+
+def test_without_a_clock_the_controller_is_unchanged():
+    a, b = ZeroGridController(ControllerConfig()), _pulse_ctrl()
+    bats = _bats([60, 60, 60])
+    for g in (1000, -1000, 1000, -1000, 1000, -1000):
+        assert a.update(g, bats) == b.update(g, bats)
+
+
+def test_replay_induction_hob_import_drops_with_pulse_hold():
+    """The 2026-09-22 17:18 case through the REAL controller: 1.08 kW hob, 3.5 s on /
+    3.5 s off, 2.26 kW base; grid sampled every 5 s, the manager acts every 3 s on a
+    new sample, batteries follow after ~1 s with a ~6 s ramp (tau 2.5 s)."""
+    import math
+
+    def replay(hold):
+        c = _pulse_ctrl(hold)
+        c.config.target_grid_w = -60
+        bats = [BatteryState(id="fleet", soc=60, min_soc=11, max_power=7500)]
+        load = lambda t: 3342.0 if (t % 7.0) < 3.5 else 2262.0
+        dt, t, b, tb = 0.1, -60.0, 2262.0, 2262.0
+        sample_t = sample = seen = None
+        next_sample = next_tick = -60.0
+        pending, imp = [], 0.0
+        while t < 520.0:
+            if t >= next_sample:
+                sample, sample_t, next_sample = load(t) - b, t, next_sample + 5.0
+            if t >= next_tick:
+                next_tick += 3.0
+                if sample_t is not None and sample_t != seen:
+                    seen = sample_t
+                    sp = c.update(sample, bats, now=t)
+                    pending.append((t + 1.0, sum(sp.values())))
+            while pending and pending[0][0] <= t:
+                tb = pending.pop(0)[1]
+            b += (tb - b) * (1 - math.exp(-dt / 2.5))
+            g = load(t) - b
+            if t >= 0 and g > 0:
+                imp += g * dt / 3600
+            t += dt
+        return imp
+
+    chase, hold = replay(False), replay(True)
+    assert chase > 20, chase                     # the flip-flop really imports
+    assert hold < 0.3 * chase, (hold, chase)    # pulse hold removes most of it
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

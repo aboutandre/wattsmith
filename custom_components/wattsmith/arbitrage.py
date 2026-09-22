@@ -261,6 +261,27 @@ def _forward_sim(
     return deficits, trace
 
 
+def forecast_deficit_wh(buckets: list[Bucket], bat: BatteryModel) -> float | None:
+    """Total grid energy the fleet will NOT be able to cover in the horizon (Wh).
+
+    The same PV-first forward simulation the planner runs, without any purchases:
+    0 means the stored energy plus forecast PV covers every bucket, i.e. the fleet
+    will not run short before it refills — its energy is in surplus. None when there
+    is no forecast to judge by. Used to gate the zero-grid pulse hold (hel-136).
+    """
+    if not buckets or bat.capacity_wh <= 0:
+        return None
+    cap = bat.capacity_wh
+    usable_now = cap * max(0.0, bat.soc_pct - bat.min_soc) / 100.0
+    cap_usable = cap * max(0.0, bat.max_soc - bat.min_soc) / 100.0
+    deficits, _trace = _forward_sim(
+        buckets, usable_now, cap_usable,
+        pv_charge_limit_wh=bat.charge_power_w * BUCKET_H,
+        discharge_limit_wh=bat.charge_power_w * BUCKET_H,
+    )
+    return sum(wh for _i, _p, wh in deficits)
+
+
 def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> ArbitragePlan:
     """Decide the current-window grid-charge + discharge-hold. buckets[0] = now."""
     if not buckets or bat.capacity_wh <= 0:

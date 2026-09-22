@@ -136,6 +136,8 @@ class ManagerSensor(CoordinatorEntity, SensorEntity):
             "arbitrage_charging": data.get("arb_charging", False),
             # True while a SOC-calibration full charge has lifted the ceiling to 100%
             "calibrating": data.get("calibrating", False),
+            # pulse hold (hel-136): switch state, surplus gate, pulsing load seen, floor W
+            "pulse_hold": data.get("pulse_hold"),
         }
 
 

@@ -52,6 +52,18 @@ class ControllerConfig:
     deadband_w: int = 40       # ignore tiny grid errors to avoid jitter
     max_step_w: int = 800      # max change of total command per cycle (gentle ramp)
     direction_hysteresis_w: int = 60  # must exceed this to FLIP charge<->discharge
+    # Pulse hold (hel-136): a load that switches on and off every few seconds (an
+    # induction hob pulsing ~1 kW on a 7 s cycle) is faster than the batteries can
+    # follow (~1 s delay + ~6 s ramp), so chasing it imports on every on-pulse and
+    # exports on every off-pulse. While such pulsing is detected, the command is
+    # held at the highest demand of the last `pulse_hold_s`: the on-pulses are
+    # covered from the battery and the off-pulses export instead. The manager sets
+    # `pulse_hold` each tick (switch on AND stored energy is in surplus).
+    pulse_hold: bool = False
+    pulse_hold_s: float = 20.0         # hold the peak demand this long
+    pulse_detect_s: float = 30.0       # look for pulsing over this window
+    pulse_min_step_w: float = 300.0    # a demand step at least this big counts
+    pulse_min_reversals: int = 3       # up/down reversals within the window = pulsing
 
 
 @dataclass
@@ -62,18 +74,59 @@ class ZeroGridController:
     _command_total: float = 0.0   # last total battery command (W, + = discharge)
     _prev_error: float = 0.0
     _last_sign: int = 0           # sign of last non-zero output (for direction hysteresis)
+    # (time, battery power that would have met the target) — for pulse detection
+    _needs: list = field(default_factory=list)
+    pulsing: bool = False         # published: is a pulsing load being detected?
+    hold_floor_w: float = 0.0     # published: current pulse-hold floor (0 = not holding)
 
     def reset(self) -> None:
         self._command_total = 0.0
         self._prev_error = 0.0
         self._last_sign = 0
+        self._needs = []
+        self.pulsing = False
+        self.hold_floor_w = 0.0
 
-    def update(self, grid_power: float, batteries: list[BatteryState]) -> dict[str, int]:
-        """Compute per-battery setpoints (W, + = discharge) for this tick."""
+    def _pulse_floor(self, need: float, now: float | None) -> float | None:
+        """Record demand; return the hold floor while a pulsing load is detected."""
+        cfg = self.config
+        if now is None:
+            return None
+        horizon = max(cfg.pulse_detect_s, cfg.pulse_hold_s)
+        self._needs.append((now, need))
+        self._needs = [(t, n) for t, n in self._needs if now - t <= horizon]
+        recent = [n for t, n in self._needs if now - t <= cfg.pulse_detect_s]
+        steps = [b - a for a, b in zip(recent, recent[1:]) if abs(b - a) >= cfg.pulse_min_step_w]
+        reversals = sum(1 for a, b in zip(steps, steps[1:]) if (a > 0) != (b > 0))
+        # Hysteresis: 3 reversals switch detection ON, and it stays on while any
+        # reversal remains in the window. Sampling a 7 s pulse every 5 s aliases, so
+        # the count dips below 3 now and then; dropping the hold on each dip gave back
+        # a third of the benefit in the replay.
+        self.pulsing = reversals >= (1 if self.pulsing else cfg.pulse_min_reversals)
+        if not (cfg.pulse_hold and self.pulsing):
+            self.hold_floor_w = 0.0
+            return None
+        peak = max(n for t, n in self._needs if now - t <= cfg.pulse_hold_s)
+        if peak <= 0:
+            # the pulses ride on a PV surplus: nothing to cover from the battery, and a
+            # floor of 0 would stop it charging and export the PV instead
+            self.hold_floor_w = 0.0
+            return None
+        self.hold_floor_w = peak                # only ever holds DISCHARGE up
+        return peak
+
+    def update(self, grid_power: float, batteries: list[BatteryState],
+               now: float | None = None) -> dict[str, int]:
+        """Compute per-battery setpoints (W, + = discharge) for this tick.
+
+        `now` (monotonic seconds) enables pulse detection; without it the pulse
+        hold is inert and the controller behaves exactly as before.
+        """
         cfg = self.config
         error = grid_power - cfg.target_grid_w
+        floor = self._pulse_floor(self._command_total + error, now)
 
-        if abs(error) <= cfg.deadband_w:
+        if abs(error) <= cfg.deadband_w and floor is None:
             # Within deadband: HOLD the current command (no change, no derivative kick),
             # but re-split in case SOC shifted. Reset prev_error so the next out-of-band
             # cycle computes a clean derivative (avoids a kick when leaving the band).
@@ -85,6 +138,8 @@ class ZeroGridController:
         delta = _clamp(delta, -cfg.max_step_w, cfg.max_step_w)
 
         command = self._command_total + delta
+        if floor is not None:
+            command = max(command, floor)   # cover the on-pulses; export the off-pulses
 
         # Capacity limits depend on which batteries can charge/discharge right now
         discharge_cap = sum(

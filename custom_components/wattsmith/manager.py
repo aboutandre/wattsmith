@@ -52,6 +52,7 @@ from .const import (
     CONF_SUN_SENSOR,
     CONF_TARGET_GRID_W,
     DOMAIN,
+    CONF_PULSE_HOLD_ENABLED,
 )
 from .settings import (
     DEFAULT_ADAPTIVE_BASELINE_W,
@@ -81,6 +82,7 @@ from .settings import (
     MANAGER_GRID_MAX_AGE_S,
     MANAGER_RESEND_S,
     MANAGER_TICK_S,
+    DEFAULT_PULSE_HOLD_ENABLED,
 )
 from .controller import ControllerConfig, ZeroGridController
 from .planner import BatteryReading, DispatchPlanner, Observation, Plan, PlannerConfig
@@ -122,6 +124,9 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         self._adaptive: AdaptiveResult | None = None
         # True while a calibration full charge is lifting the ceiling (published on status).
         self._calibrating = False
+        # Pulse hold state (published on status).
+        self._pulse_hold_enabled = DEFAULT_PULSE_HOLD_ENABLED
+        self._energy_surplus = False
         # True while actively grid-charging for arbitrage (published on status).
         self._arb_charging: bool = False
 
@@ -244,6 +249,11 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         """Arbitrage discharge-hold floor (only when the Arbitrage switch is on)."""
         arb = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_arb")
         return getattr(arb, "hold_floor_soc", None)
+
+    def _arb_energy_surplus(self) -> bool:
+        """True when the arbitrage forecast sees no shortfall before the fleet refills."""
+        arb = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_arb")
+        return bool(getattr(arb, "energy_surplus", False))
 
     def _arb_calibration_open_ceiling(self) -> bool:
         """True while the arbitrage coordinator says a calibration charge is due."""
@@ -535,6 +545,12 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             # battery is really full, so when a calibration is due the ceiling goes
             # to 100% and PV (or a scheduled grid top-up) finishes the job. The EV
             # right-of-way below still applies — the car keeps first claim on PV.
+            # Pulse hold (hel-136): over-compensate a pulsing load (induction hob)
+            # instead of importing on every on-pulse — but only while the stored energy
+            # is in surplus, since the off-pulses export it at the feed-in price.
+            self._pulse_hold_enabled = bool(self._opt(CONF_PULSE_HOLD_ENABLED, DEFAULT_PULSE_HOLD_ENABLED))
+            self._energy_surplus = self._arb_energy_surplus()
+            self.controller.config.pulse_hold = self._pulse_hold_enabled and self._energy_surplus
             self._calibrating = self._arb_calibration_open_ceiling()
             if self._calibrating:
                 self.planner.config.max_battery_soc = 100.0
@@ -615,6 +631,12 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             "excluded_batteries": plan.excluded,
             "arb_charging": self._arb_charging,
             "calibrating": self._calibrating,
+            "pulse_hold": {
+                "enabled": self._pulse_hold_enabled,
+                "energy_surplus": self._energy_surplus,
+                "pulsing_load": self.controller.pulsing,
+                "holding_w": round(self.controller.hold_floor_w),
+            },
             "safety": self.supervisor.status(now),
             "target_grid_w": self.controller.config.target_grid_w,
             "adaptive": self._adaptive_status(),

@@ -100,3 +100,6 @@ CONF_CALIBRATION_ENABLED: Final = "calibration_enabled"
 CONF_CALIBRATION_THRESHOLD_PTS: Final = "calibration_threshold_pts"  # predicted drift that makes it due
 CONF_CALIBRATION_MAX_DAYS: Final = "calibration_max_days"            # safety net: due after this many days
 CONF_CALIBRATION_GRID: Final = "calibration_grid"                    # allow a grid top-up when PV fails
+
+# Pulse hold (hel-136): over-compensate a pulsing load (induction hob) instead of importing
+CONF_PULSE_HOLD_ENABLED: Final = "pulse_hold_enabled"

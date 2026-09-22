@@ -349,6 +349,23 @@ def test_today_only_forecast_invents_a_need_tomorrow_afternoon():
     assert bad.profitable_deficit_wh > 0 and bad.next_need_price_ct == 60.0
     assert good.next_need_price_ct != 60.0
 
+
+# ── surplus gate for the zero-grid pulse hold (hel-136) ─────────────────────
+def test_forecast_deficit_zero_when_storage_covers_the_horizon():
+    full = BatteryModel(soc_pct=90.0, capacity_wh=15360.0, min_soc=13.0, max_soc=100.0,
+                        charge_power_w=7500.0)
+    buckets = [Bucket(30.0, 0.0, 150.0)] * 40          # 10 h at 600 W = 6 kWh < ~11.8 kWh stored
+    assert a.forecast_deficit_wh(buckets, full) == 0.0
+
+
+def test_forecast_deficit_counts_the_shortfall():
+    low = BatteryModel(soc_pct=20.0, capacity_wh=15360.0, min_soc=13.0, max_soc=100.0,
+                       charge_power_w=7500.0)
+    buckets = [Bucket(30.0, 0.0, 150.0)] * 40
+    d = a.forecast_deficit_wh(buckets, low)
+    assert abs(d - (6000.0 - 15360.0 * 0.07)) < 5.0
+    assert a.forecast_deficit_wh([], low) is None
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

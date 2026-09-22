@@ -15,10 +15,41 @@ from .const import (
     CONF_ARBITRAGE_ENABLED,
     CONF_CALIBRATION_ENABLED,
     CONF_CALIBRATION_GRID,
+    CONF_PULSE_HOLD_ENABLED,
     DOMAIN,
 )
 from .manager import EnergyManagerCoordinator
-from .settings import DEFAULT_CALIBRATION_ENABLED, DEFAULT_CALIBRATION_GRID
+from .settings import (
+    DEFAULT_CALIBRATION_ENABLED,
+    DEFAULT_CALIBRATION_GRID,
+    DEFAULT_PULSE_HOLD_ENABLED,
+)
+
+# Plain-language intent, published as each switch's `purpose` attribute so the
+# more-info dialog explains what the toggle does long after it was set up.
+PURPOSE_PULSE_HOLD = (
+    "Stops the import/export flip-flop caused by loads that switch on and off every few "
+    "seconds (induction hob). The batteries need ~7 s to follow a new command, so they "
+    "cannot track a 3.5 s pulse: without this, every on-pulse imports and every off-pulse "
+    "exports. While such pulsing is detected, the battery output is held at the peak "
+    "demand of the last 20 s: the house draws nothing from the grid and the gaps are "
+    "exported instead. Only active while stored energy is in SURPLUS (the forecast sees no "
+    "shortfall before the batteries refill), because exported battery energy only earns the "
+    "feed-in price. Replay of 2026-09-22: grid import -85% while cooking. "
+    "ON = allowed (still waits for pulsing + surplus); OFF = always chase the load."
+)
+PURPOSE_CALIBRATION = (
+    "The Marstek battery's SOC reading drifts below reality by ~1.3 points per kWh it "
+    "discharges and only corrects itself when the battery is truly full, so energy below the "
+    "displayed floor is stranded. When a battery's predicted drift reaches the Calibration "
+    "Drift Threshold (or the Max Interval passes), Wattsmith lifts the charge ceiling to 100% "
+    "so PV can fill it and reset the count. OFF = never force a full charge."
+)
+PURPOSE_CALIBRATION_GRID = (
+    "If PV has not finished a due calibration after 4 more points of drift, top the fleet up "
+    "to 100% from the grid in the cheapest window of the next 24 h (needs Arbitrage Control "
+    "on). OFF = calibrate from PV only, however long that takes."
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,10 +70,13 @@ async def async_setup_entry(
         switches.append(ArbitrageEnableSwitch(arb, entry))
         switches.append(OptionSwitch(
             arb, entry, CONF_CALIBRATION_ENABLED, DEFAULT_CALIBRATION_ENABLED,
-            "SOC Calibration", "mdi:battery-sync"))
+            "SOC Calibration", "mdi:battery-sync", PURPOSE_CALIBRATION))
         switches.append(OptionSwitch(
             arb, entry, CONF_CALIBRATION_GRID, DEFAULT_CALIBRATION_GRID,
-            "SOC Calibration Grid Top-Up", "mdi:transmission-tower-import"))
+            "SOC Calibration Grid Top-Up", "mdi:transmission-tower-import",
+            PURPOSE_CALIBRATION_GRID))
+    # on the manager coordinator (3 s) so its live attributes follow the control loop
+    switches.append(PulseHoldSwitch(coordinator, entry))
     async_add_entities(switches)
 
 
@@ -169,11 +203,12 @@ class OptionSwitch(CoordinatorEntity, SwitchEntity):
     _attr_has_entity_name = True
 
     def __init__(self, coordinator, entry: ConfigEntry, key: str, default: bool,
-                 name: str, icon: str) -> None:
+                 name: str, icon: str, purpose: str) -> None:
         super().__init__(coordinator)
         self._entry = entry
         self._key = key
         self._default = default
+        self._purpose = purpose
         self._attr_unique_id = f"{entry.entry_id}_{key}"
         self._attr_name = name
         self._attr_icon = icon
@@ -188,6 +223,10 @@ class OptionSwitch(CoordinatorEntity, SwitchEntity):
     def is_on(self) -> bool:
         return bool(self._entry.options.get(self._key, self._default))
 
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {"purpose": self._purpose}
+
     async def _set(self, value: bool) -> None:
         new_options = {**self._entry.options, self._key: value}
         self.hass.config_entries.async_update_entry(self._entry, options=new_options)
@@ -198,3 +237,24 @@ class OptionSwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         await self._set(False)
+
+
+class PulseHoldSwitch(OptionSwitch):
+    """Pulse hold (hel-136) — see PURPOSE_PULSE_HOLD; attributes show it working live."""
+
+    def __init__(self, coordinator: EnergyManagerCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, CONF_PULSE_HOLD_ENABLED, DEFAULT_PULSE_HOLD_ENABLED,
+                         "Pulse Hold", "mdi:stove", PURPOSE_PULSE_HOLD)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        live = (self.coordinator.data or {}).get("pulse_hold") or {}
+        return {
+            "purpose": self._purpose,
+            # is the stored energy in surplus right now (the gate)?
+            "energy_surplus": live.get("energy_surplus"),
+            # is a pulsing load being detected right now?
+            "pulsing_load": live.get("pulsing_load"),
+            # battery output currently held (W); 0 = not holding
+            "holding_w": live.get("holding_w"),
+        }

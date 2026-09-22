@@ -29,6 +29,15 @@ MANAGER_BATTERY_FAIL_THRESHOLD: Final[int] = 3
 MANAGER_CYCLE_FAIL_THRESHOLD: Final[int] = 3
 MANAGER_DEGRADED_THRESHOLD: Final[int] = 3    # consecutive missed acks before "degraded"
 
+# === Pulse hold (hel-136) ======================================================
+# A load pulsing faster than the batteries can follow (induction hob: ~1 kW, 3.5 s
+# on / 3.5 s off) makes the loop import on every on-pulse and export on every
+# off-pulse. Pulse hold keeps the battery at the peak demand while pulsing is seen,
+# but ONLY while stored energy is in surplus (arbitrage forecast: no shortfall).
+# Replay of 2026-09-22 17:18: import -85%; saves ~7-8 ct per cooking hour with
+# surplus energy, would cost ~5-6 ct/h if the energy were scarce (hence the gate).
+DEFAULT_PULSE_HOLD_ENABLED: Final[bool] = True
+
 # === Controller (PD) defaults ================================================
 DEFAULT_TARGET_GRID_W: Final[int] = -50
 DEFAULT_KP: Final[float] = 0.65

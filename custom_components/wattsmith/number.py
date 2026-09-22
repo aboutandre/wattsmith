@@ -71,6 +71,7 @@ class ManagerNumber:
     unit: str | None
     icon: str
     getter: Callable[[EnergyManagerCoordinator], float]
+    purpose: str | None = None    # plain-language intent, shown as the `purpose` attribute
 
 
 @dataclass(frozen=True)
@@ -136,11 +137,16 @@ NUMBERS: tuple[ManagerNumber, ...] = (
     ManagerNumber(CONF_CALIBRATION_THRESHOLD_PTS, "Calibration Drift Threshold", 2, 30, 1, "%",
                   "mdi:battery-sync-outline",
                   lambda c: float(c.entry.options.get(CONF_CALIBRATION_THRESHOLD_PTS,
-                                                      DEFAULT_CALIBRATION_THRESHOLD_PTS))),
+                                                      DEFAULT_CALIBRATION_THRESHOLD_PTS)),
+                  "A battery gets a calibration full charge once its SOC reading is predicted "
+                  "to under-report by this many points (the BMS drifts ~1.3 points per kWh "
+                  "discharged and resets at full). Lower = more frequent full charges."),
     ManagerNumber(CONF_CALIBRATION_MAX_DAYS, "Calibration Max Interval", 1, 30, 1, "d",
                   "mdi:calendar-sync",
                   lambda c: float(c.entry.options.get(CONF_CALIBRATION_MAX_DAYS,
-                                                      DEFAULT_CALIBRATION_MAX_DAYS))),
+                                                      DEFAULT_CALIBRATION_MAX_DAYS)),
+                  "Safety net: a battery gets a calibration full charge after this many days "
+                  "without reaching 100%, whatever its predicted drift."),
 )
 
 
@@ -194,6 +200,10 @@ class MarstekManagerNumber(CoordinatorEntity, NumberEntity):
     @property
     def native_value(self) -> float:
         return float(self._desc.getter(self.coordinator))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str] | None:
+        return {"purpose": self._desc.purpose} if self._desc.purpose else None
 
     async def async_set_native_value(self, value: float) -> None:
         # Persist to options; the manager's options-update listener applies it live.
@@ -274,6 +284,14 @@ class EtaOverrideNumber(CoordinatorEntity, NumberEntity):
             "manufacturer": "Wattsmith",
             "model": "Energy Brain",
         }
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str]:
+        return {"purpose": (
+            "Round-trip efficiency the arbitrage planner uses to decide whether buying now "
+            "for later pays off. 0 = auto: measured from the history DB between full-charge "
+            "resets (the only windows where the drifting SOC reading is exact). Set 50-100 "
+            "only to override the measurement.")}
 
     @property
     def native_value(self) -> float:

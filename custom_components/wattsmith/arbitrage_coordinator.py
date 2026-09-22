@@ -27,6 +27,7 @@ from .arbitrage import (
     BatteryModel,
     Econ,
     build_buckets,
+    forecast_deficit_wh,
     plan_arbitrage,
     pv_slots_from_detailed,
     solcast_forecast_entities,
@@ -132,6 +133,16 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
     def calibration_open_ceiling(self) -> bool:
         """True while a calibration full charge is due (manager lifts the ceiling to 100%)."""
         return bool(self._calibration and self._calibration.open_ceiling)
+
+    @property
+    def energy_surplus(self) -> bool:
+        """True when stored energy + forecast PV cover the whole horizon (no shortfall).
+
+        Gates the zero-grid pulse hold: over-compensating a pulsing load exports
+        battery energy at the feed-in price, which only pays when that energy would
+        not be needed later anyway. Unknown (no plan yet) counts as not in surplus.
+        """
+        return bool((self.data or {}).get("energy_surplus"))
 
     @property
     def hold_floor_soc(self) -> float | None:
@@ -384,6 +395,7 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
                 horizon_h=ARBITRAGE_HORIZON_H,
             )
             plan = plan_arbitrage(buckets, bat, econ)
+            deficit = forecast_deficit_wh(buckets, bat)
             try:
                 calib = await self._async_calibration(bat, buckets, eta)
             except Exception as err:  # noqa: BLE001 - calibration must never break arbitrage
@@ -398,6 +410,8 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
             self._write_advisory(plan, eta, wear)
             return {
                 **calib,
+                "deficit_wh": deficit,
+                "energy_surplus": deficit is not None and deficit <= 1.0,
                 "grid_charge_now_wh": plan.grid_charge_now_wh,
                 "target_soc": plan.target_soc,
                 "hold_floor_soc": plan.hold_floor_soc,

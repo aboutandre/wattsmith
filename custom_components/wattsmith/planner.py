@@ -270,7 +270,7 @@ class DispatchPlanner:
         new_sample = obs.grid_key != self._last_grid_key
         if new_sample:
             setpoints = self.controller.update(grid_power=obs.grid_value - ev,
-                                               batteries=healthy)
+                                               batteries=healthy, now=obs.now)
             self._note_direction_flips(setpoints, obs.now)
             self._last_setpoints = setpoints
             self._last_grid_key = obs.grid_key
