@@ -74,6 +74,7 @@ from .settings import (
     DEFAULT_CALIBRATION_MAX_DAYS,
     DEFAULT_CALIBRATION_THRESHOLD_PTS,
     DRIFT_HISTORY_DAYS,
+    DRIFT_MAX_GAP_BUCKETS,
     DRIFT_MIN_WINDOWS,
     DRIFT_STATE_DAYS,
     ETA_MIN_WINDOWS,
@@ -88,6 +89,7 @@ from .soc_drift import (
     fit_eta_standby,
     full_to_full_windows,
     plan_calibration,
+    reset_events,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -177,8 +179,10 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         try:
             rows = await query(int(now - DRIFT_HISTORY_DAYS * 86400), int(now),
                                table="battery_bucket", limit=DRIFT_HISTORY_DAYS * 96 * 16)
-            windows = full_to_full_windows(rows)
-            fit = fit_eta_standby(windows, min_windows=ETA_MIN_WINDOWS)
+            windows = full_to_full_windows(rows, max_gap_buckets=DRIFT_MAX_GAP_BUCKETS)
+            # η needs the exact energy balance: only gap-free windows
+            fit = fit_eta_standby([w for w in windows if w.missing_buckets == 0],
+                                  min_windows=ETA_MIN_WINDOWS)
             by_bat: dict[str, list] = {}
             for w in windows:
                 by_bat.setdefault(w.battery_id, []).append(w)
@@ -188,13 +192,22 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         except Exception as err:  # noqa: BLE001 - measurement must never break the tick
             _LOGGER.warning("arbitrage: history refresh failed: %s", err)
             return
+        # log every BMS reset in the window (idempotent) so the drift model can be
+        # checked against reality over time — best effort, never breaks the refresh
+        recorder = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_history")
+        logger = getattr(recorder, "async_record_calibration_events", None)
+        if callable(logger):
+            try:
+                await logger(reset_events(windows, min_windows=DRIFT_MIN_WINDOWS))
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("arbitrage: logging calibration events failed: %s", err)
         lo, hi = ETA_VALID_RANGE
         valid = fit is not None and lo <= fit.eta <= hi
         self._eta_detail = {
             "eta_measured": round(fit.eta, 4) if fit else None,
             "eta_measured_valid": valid,
             "eta_standby_w": round(fit.standby_w, 1) if fit else None,
-            "eta_windows": len(windows),
+            "eta_windows": fit.windows if fit else 0,
             "eta_window_days": DRIFT_HISTORY_DAYS,
             "eta_measured_at": dt_util.utc_from_timestamp(now).isoformat(),
         }
@@ -419,3 +432,6 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         writer = getattr(rec, "note_advisory", None)
         if callable(writer):
             writer(plan.grid_charge_now_wh, plan.reason, eta, wear / 100.0)
+        note = getattr(rec, "note_calibration", None)
+        if callable(note):
+            note(self._calibration.status if self._calibration else None)

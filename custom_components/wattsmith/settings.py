@@ -104,6 +104,7 @@ ETA_MIN_WINDOWS: Final[int] = 6                  # full-to-full windows before Î
 DRIFT_HISTORY_DAYS: Final[int] = 90              # history the fits look back over
 DRIFT_STATE_DAYS: Final[int] = 15                # "since last full" lookback per tick
 DRIFT_MIN_WINDOWS: Final[int] = 4                # resets per battery before its own rate is used
+DRIFT_MAX_GAP_BUCKETS: Final[int] = 4            # restart gaps tolerated by drift fit + reset log (Î·: none)
 
 # SOC calibration (hel-134). A battery is due once its PREDICTED drift reaches the
 # threshold (learned per battery: points per kWh discharged since its last full

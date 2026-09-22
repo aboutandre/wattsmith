@@ -62,8 +62,13 @@ def test_windows_run_between_full_charges_and_break_on_gaps():
     ws = sd.full_to_full_windows(rows)
     assert len(ws) >= 5
     assert all(w.jump_pts > 0 for w in ws)
-    gapped = rows[:500] + rows[510:]                 # a logging hole
+    gapped = rows[:500] + rows[510:]                 # a 10-bucket logging hole
     assert len(sd.full_to_full_windows(gapped)) < len(ws)
+    small = rows[:500] + rows[501:]                  # one bucket (an HA restart)
+    tolerant = sd.full_to_full_windows(small, max_gap_buckets=4)
+    assert len(tolerant) == len(ws)
+    assert sum(w.missing_buckets for w in tolerant) == 1
+    assert len(sd.full_to_full_windows(small)) < len(ws)    # strict (η) still drops it
 
 
 def test_drift_rate_is_learned_from_the_resets():
@@ -168,6 +173,38 @@ def test_calibration_grid_off_or_disabled():
     assert _plan({"a": _drift(13.0, 4.0)}, grid=False).status == "due"
     assert _plan({"a": _drift(13.0, 4.0)}, enabled=False).status == "off"
 
+
+
+def test_reset_events_predict_walk_forward_only():
+    ws = sd.full_to_full_windows(simulate(days=40))
+    evs = sd.reset_events(ws, min_windows=4)
+    assert len(evs) == len(ws)
+    assert evs[0]["predicted_pts"] is None             # nothing before the first reset
+    later = [e for e in evs if e["predicted_pts"] is not None]
+    assert later, "predictions appear once enough resets are known"
+    # honest predictions track the real jumps on the simulated battery
+    err = sum(abs(e["predicted_pts"] - e["actual_pts"]) for e in later) / len(later)
+    assert err < 3.0, err
+    assert all(e["ts"] % 900 == 0 for e in evs)
+
+
+def test_reset_measured_across_a_restart_split_bucket():
+    """Regression (live 2026-09-22 15:15, F9): a restart inside the reset bucket made
+    it start at 98 although the battery snapped 80 -> 100; the jump must come from
+    the previous bucket's end."""
+    rows = simulate(days=12)
+    ws = sd.full_to_full_windows(rows)
+    last_anchor = max(i for i, r in enumerate(rows) if r["soc_end"] >= sd.FULL_SOC
+                      and r["soc_start"] < sd.FULL_SOC)
+    split = [dict(r) for r in rows]
+    split[last_anchor]["soc_start"] = 98.0              # partial bucket after a restart
+    split[last_anchor]["charge_wh"] = 5.0
+    ws2 = sd.full_to_full_windows(split)
+    assert abs(ws2[-1].jump_pts - ws[-1].jump_pts) < 2.5, (ws2[-1].jump_pts, ws[-1].jump_pts)
+    # ...and when the split bucket starts already FULL it is still recognised as the reset
+    split[last_anchor]["soc_start"] = 100.0
+    ws3 = sd.full_to_full_windows(split)
+    assert len(ws3) == len(ws) and abs(ws3[-1].jump_pts - ws[-1].jump_pts) < 2.5
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

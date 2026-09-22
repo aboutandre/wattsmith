@@ -36,6 +36,7 @@ class Window:
     charge_wh: float
     discharge_wh: float
     jump_pts: float          # size of the BMS correction that closed the window
+    missing_buckets: int = 0  # logging gaps inside the window (restarts)
 
     @property
     def hours(self) -> float:
@@ -53,22 +54,41 @@ def _by_battery(rows: list[dict]) -> dict[str, list[dict]]:
     return out
 
 
-def _is_anchor(r: dict) -> bool:
-    """First bucket of a full episode: ends full, did not start full."""
-    return r["soc_end"] >= FULL_SOC and r["soc_start"] < FULL_SOC
+def _anchors(bat_rows: list[dict]) -> list[int]:
+    """First bucket of each full episode: ends full, and the battery was not full
+    before it. "Before" is the previous bucket's END, not this bucket's start: a
+    restart can split the reset bucket so it starts already full (seen live on
+    2026-09-22: F11 snapped at 15:16, the post-restart bucket started at 100)."""
+    out = []
+    for i, r in enumerate(bat_rows):
+        before = bat_rows[i - 1]["soc_end"] if i > 0 else r["soc_start"]
+        if r["soc_end"] >= FULL_SOC and before < FULL_SOC:
+            out.append(i)
+    return out
 
 
-def full_to_full_windows(rows: list[dict], min_buckets: int = 8) -> list[Window]:
-    """Every gap-free stretch between two consecutive full-charge anchors."""
+def full_to_full_windows(
+    rows: list[dict], min_buckets: int = 8, max_gap_buckets: int = 0,
+) -> list[Window]:
+    """Every stretch between two consecutive full-charge anchors.
+
+    `max_gap_buckets` tolerates short logging gaps (an HA restart drops a bucket).
+    The η fit must stay strict (a gap is missing energy in the balance), but the
+    reset itself is measured exactly, and one missing bucket barely changes the
+    energy discharged since the last full charge — so the drift fit and the
+    reset log accept small gaps rather than discard a whole week.
+    """
     windows: list[Window] = []
     for bid, bat_rows in _by_battery(rows).items():
-        anchors = [i for i, r in enumerate(bat_rows) if _is_anchor(r)]
+        anchors = _anchors(bat_rows)
         for i0, i1 in zip(anchors, anchors[1:]):
             seg = bat_rows[i0 + 1:i1 + 1]
             if len(seg) < min_buckets:
                 continue
-            if any(b["ts_start"] - a["ts_start"] != BUCKET_S for a, b in zip(seg, seg[1:])):
-                continue                   # a logging gap breaks the energy balance
+            missing = sum((b["ts_start"] - a["ts_start"]) // BUCKET_S - 1
+                          for a, b in zip(seg, seg[1:]))
+            if missing > max_gap_buckets:
+                continue
             windows.append(Window(
                 battery_id=bid,
                 start_ts=seg[0]["ts_start"],
@@ -76,6 +96,7 @@ def full_to_full_windows(rows: list[dict], min_buckets: int = 8) -> list[Window]
                 charge_wh=sum(r.get("charge_wh") or 0.0 for r in seg),
                 discharge_wh=sum(r.get("discharge_wh") or 0.0 for r in seg),
                 jump_pts=_jump_pts(seg),
+                missing_buckets=int(missing),
             ))
     return windows
 
@@ -85,9 +106,13 @@ def _jump_pts(seg: list[dict]) -> float:
 
     The reset bucket also charged normally before the snap; that part is taken
     out using the Wh-per-point the same window's charge-only buckets showed.
+    The jump is measured from the PREVIOUS bucket's end SOC: an HA restart inside
+    the reset bucket starts a partial bucket whose soc_start is sampled after the
+    snap (seen live: 98 -> 100 recorded for an 80 -> 100 reset).
     """
     last = seg[-1]
-    raw = last["soc_end"] - last["soc_start"]
+    before = seg[-2]["soc_end"] if len(seg) >= 2 else last["soc_start"]
+    raw = last["soc_end"] - before
     charged = [r for r in seg[:-1] if (r.get("charge_wh") or 0.0) > 20.0
                and (r.get("discharge_wh") or 0.0) < 2.0]
     rise = sum(r["soc_end"] - r["soc_start"] for r in charged)
@@ -120,6 +145,34 @@ def fit_drift_rate(windows: list[Window], min_windows: int = 4) -> DriftFit | No
         return None
     k = sum((x - mx) * (y - my) for x, y in pts) / sxx
     return DriftFit(pts_per_kwh=max(0.0, k), windows=n)
+
+
+def reset_events(windows: list[Window], min_windows: int = 4) -> list[dict]:
+    """One record per BMS reset, for the history DB's calibration_event table.
+
+    The prediction for each reset uses only resets that ENDED BEFORE its window
+    began (walk-forward, like the backtest) — the battery's own history if it has
+    enough, otherwise the fleet's — so the log shows how the model would really
+    have done. predicted_pts is None while there is not enough prior history.
+    """
+    ordered = sorted(windows, key=lambda w: w.end_ts)
+    out: list[dict] = []
+    for w in ordered:
+        prior = [p for p in ordered if p.end_ts <= w.start_ts]
+        own = [p for p in prior if p.battery_id == w.battery_id]
+        fit = fit_drift_rate(own, min_windows) or fit_drift_rate(prior, min_windows)
+        kwh = w.discharge_wh / 1000.0
+        out.append({
+            "ts": w.end_ts - BUCKET_S,              # the bucket in which the BMS reset
+            "battery_id": w.battery_id,
+            "days_since_full": round(w.hours / 24.0, 3),
+            "discharged_kwh": round(kwh, 3),
+            "predicted_pts": round(fit.pts_per_kwh * kwh, 2) if fit else None,
+            "actual_pts": round(w.jump_pts, 2),
+            "drift_rate": round(fit.pts_per_kwh, 3) if fit else None,
+            "missing_buckets": w.missing_buckets,
+        })
+    return out
 
 
 @dataclass(frozen=True)

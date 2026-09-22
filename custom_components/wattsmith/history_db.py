@@ -61,7 +61,7 @@ from .settings import (
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2  # 2: + battery_health liveness log
+SCHEMA_VERSION = 3  # 2: + battery_health liveness log; 3: + calibration (bucket column + event log)
 BUCKET_SECONDS = 900  # 15 minutes
 _UNAVAILABLE = ("unknown", "unavailable", "none", "")
 
@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS bucket (
   arb_reason      TEXT,
   eta_used        REAL,
   wear_used       REAL,
+  calibration_status TEXT,
   sample_count    INTEGER,
   config_version  INTEGER,
   schema_version  INTEGER
@@ -144,20 +145,40 @@ CREATE TABLE IF NOT EXISTS battery_health (
 );
 CREATE INDEX IF NOT EXISTS battery_health_by_battery
   ON battery_health (battery_id, ts);
+CREATE TABLE IF NOT EXISTS calibration_event (
+  ts               INTEGER NOT NULL,   -- start of the 15-min bucket in which the BMS reset to 100%
+  local_time       TEXT NOT NULL,
+  battery_id       TEXT NOT NULL,
+  days_since_full  REAL,               -- since the previous reset
+  discharged_kwh   REAL,               -- AC energy discharged since the previous reset
+  predicted_pts    REAL,               -- drift the model predicted (walk-forward; NULL = no model yet)
+  actual_pts       REAL,               -- size of the BMS correction, net of that bucket's charging
+  drift_rate       REAL,               -- pts per kWh the prediction used
+  source           TEXT,               -- grid | pv_calibration | natural | unknown
+  missing_buckets  INTEGER,            -- logging gaps in the window (discharged_kwh slightly low)
+  PRIMARY KEY (ts, battery_id)
+);
 CREATE TABLE IF NOT EXISTS meta ( key TEXT PRIMARY KEY, value TEXT );
 """
 
 # Tables the query_history service is allowed to read (fixed allow-list — the
 # table name is interpolated into SQL, so anything outside this set is rejected
 # before it ever reaches sqlite).
-QUERY_TABLES = ("bucket", "battery_bucket", "battery_health", "config_snapshot", "config_event")
+QUERY_TABLES = ("bucket", "battery_bucket", "battery_health", "config_snapshot", "config_event",
+                "calibration_event")
 _QUERY_TS_COLUMN = {
     "bucket": "ts_start",
     "battery_bucket": "ts_start",
     "battery_health": "ts",
     "config_snapshot": "ts",
     "config_event": "ts",
+    "calibration_event": "ts",
 }
+
+# Calibration status stamped on a bucket = the most significant one seen during it,
+# so a bucket that grid-charged and ended "ok" still says it grid-charged.
+_CALIBRATION_RANK = {"grid_charging": 5, "grid_waiting": 4, "due": 3, "ok": 2,
+                     "off": 1, "unknown": 0, "error": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +393,7 @@ class BucketAccumulator:
             "arb_reason": None,
             "eta_used": None,
             "wear_used": None,
+            "calibration_status": None,   # stamped by the recorder at flush
             "sample_count": self.sample_count,
             "config_version": config_version,
             "schema_version": SCHEMA_VERSION,
@@ -415,6 +437,8 @@ class HistoryRecorder:
         self._started = False
         # latest arbitrage advisory, stamped onto the bucket when it flushes
         self._advisory: tuple[float, str, float, float] | None = None
+        # most significant calibration status seen in the current bucket
+        self._calibration_status: str | None = None
         # battery liveness: last row written per battery, for change detection
         self._health_last: dict[str, tuple[bool, int, bool]] = {}
         self._health_last_write: dict[str, float] = {}
@@ -698,6 +722,10 @@ class HistoryRecorder:
         conn = self._connect()
         try:
             conn.executescript(SCHEMA)
+            # v3 migration: CREATE IF NOT EXISTS leaves an existing bucket table as is
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(bucket)")}
+            if "calibration_status" not in cols:
+                conn.execute("ALTER TABLE bucket ADD COLUMN calibration_status TEXT")
             conn.execute(
                 "INSERT OR IGNORE INTO meta(key,value) VALUES('created_at',?)",
                 (datetime.now().isoformat(timespec="seconds"),),
@@ -764,8 +792,54 @@ class HistoryRecorder:
         """Record the current arbitrage advisory; stamped onto the next flush."""
         self._advisory = (grid_charge_wh, reason, eta, wear_eur_per_kwh)
 
+    def note_calibration(self, status: str | None) -> None:
+        """Record the calibration status; the most significant one per bucket is stamped."""
+        if status is None:
+            return
+        cur = self._calibration_status
+        if cur is None or _CALIBRATION_RANK.get(status, 0) > _CALIBRATION_RANK.get(cur, 0):
+            self._calibration_status = status
+
+    async def async_record_calibration_events(self, events: list[dict[str, Any]]) -> None:
+        """Log BMS resets (idempotent: one row per bucket and battery)."""
+        if events:
+            await self.hass.async_add_executor_job(self._write_calibration_events, events)
+
+    def _write_calibration_events(self, events: list[dict[str, Any]]) -> None:
+        conn = self._connect()
+        try:
+            for ev in events:
+                # what drove it, from the calibration status stamped on the reset
+                # bucket and the hour before it
+                seen = {r[0] for r in conn.execute(
+                    "SELECT calibration_status FROM bucket WHERE ts_start BETWEEN ? AND ? "
+                    "AND calibration_status IS NOT NULL",
+                    (ev["ts"] - 3600, ev["ts"]))}
+                if "grid_charging" in seen:
+                    source = "grid"
+                elif seen & {"due", "grid_waiting"}:
+                    source = "pv_calibration"
+                elif seen:
+                    source = "natural"
+                else:
+                    source = "unknown"      # before v0.12.2, or no status logged
+                conn.execute(
+                    "INSERT OR IGNORE INTO calibration_event(ts,local_time,battery_id,"
+                    "days_since_full,discharged_kwh,predicted_pts,actual_pts,drift_rate,source,"
+                    "missing_buckets) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (ev["ts"], datetime.fromtimestamp(ev["ts"]).isoformat(timespec="seconds"),
+                     ev["battery_id"], ev["days_since_full"], ev["discharged_kwh"],
+                     ev["predicted_pts"], ev["actual_pts"], ev["drift_rate"], source,
+                     ev.get("missing_buckets", 0)),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
     async def _flush(self, accum: BucketAccumulator) -> None:
         row = accum.bucket_row(self._config_version)
+        row["calibration_status"] = self._calibration_status
+        self._calibration_status = None
         if self._advisory is not None:
             gc, reason, eta, wear = self._advisory
             row["grid_charge_wh"] = round(gc, 2)

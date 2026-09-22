@@ -403,6 +403,73 @@ def test_battery_health_is_queryable_end_to_end():
         assert rows[0]["battery_id"] == "b0" and rows[0]["soc"] == 42.0
 
 
+
+# ── v3: calibration logging (hel-134 follow-up) ─────────────────────────────
+_V2_BUCKET = """CREATE TABLE bucket (ts_start INTEGER PRIMARY KEY, local_start TEXT NOT NULL,
+  pv_wh REAL, grid_charge_wh REAL, arb_reason TEXT, sample_count INTEGER,
+  config_version INTEGER, schema_version INTEGER)"""
+
+
+def test_v3_migration_adds_calibration_status_to_an_existing_bucket_table():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = os.path.join(d, "history.db")
+        conn = sqlite3.connect(tmp)
+        conn.execute(_V2_BUCKET)
+        conn.execute("INSERT INTO bucket(ts_start,local_start,pv_wh) VALUES(900,'x',1.0)")
+        conn.commit(); conn.close()
+        rec = _recorder(tmp)
+        rec._init_db()
+        rec._init_db()                                   # idempotent
+        conn = sqlite3.connect(tmp)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(bucket)")}
+        assert "calibration_status" in cols
+        assert conn.execute("SELECT pv_wh FROM bucket WHERE ts_start=900").fetchone()[0] == 1.0
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "calibration_event" in tables
+        conn.close()
+
+
+def test_calibration_status_stamps_the_most_significant_per_bucket():
+    rec = _recorder("/nonexistent/x.db")
+    for st in ("ok", "grid_charging", "ok", None):
+        rec.note_calibration(st)
+    assert rec._calibration_status == "grid_charging"
+
+
+def test_calibration_events_are_idempotent_and_classified_by_source():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = os.path.join(d, "history.db")
+        rec = _recorder(tmp)
+        rec._init_db()
+        conn = sqlite3.connect(tmp)
+        for ts, st in ((9000, "grid_charging"), (90000, "due"), (180000, "ok")):
+            conn.execute("INSERT INTO bucket(ts_start,local_start,calibration_status) VALUES(?,?,?)",
+                         (ts, "x", st))
+        conn.commit(); conn.close()
+
+        def ev(ts, bid="f9"):
+            return {"ts": ts, "battery_id": bid, "days_since_full": 3.0, "discharged_kwh": 6.0,
+                    "predicted_pts": 7.8, "actual_pts": 8.5, "drift_rate": 1.3}
+        events = [ev(9000), ev(90000), ev(180000), ev(500000)]
+        rec._write_calibration_events(events)
+        rec._write_calibration_events(events)           # re-logged every refresh: no duplicates
+        conn = sqlite3.connect(tmp)
+        rows = conn.execute("SELECT ts, source FROM calibration_event ORDER BY ts").fetchall()
+        conn.close()
+        assert rows == [(9000, "grid"), (90000, "pv_calibration"), (180000, "natural"),
+                        (500000, "unknown")]
+
+
+def test_calibration_event_is_queryable():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = os.path.join(d, "history.db")
+        rec = _recorder(tmp)
+        rec._init_db()
+        rec._write_calibration_events([{"ts": 9000, "battery_id": "f9", "days_since_full": 1.0,
+                                        "discharged_kwh": 2.0, "predicted_pts": None,
+                                        "actual_pts": 3.0, "drift_rate": None}])
+        assert len(rec.query_range(0, 10**6, table="calibration_event")) == 1
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
