@@ -35,6 +35,15 @@ FINDINGS (2026-09-22, 48 episodes x 7 days, eta 0.72, margin 15%):
   - TOMORROW'S PV INVISIBLE (reading only Solcast's forecast_today, hel-131, live until
     v0.11.1): +EUR 9-14 over the sweep (1.3-1.8%), 13-25% more energy bought, almost
     all in Oct/Feb/Mar when tomorrow has real sun. Simulate with pv_tomorrow=False.
+
+FINDINGS (2026-09-24, merit-order discharge hold, v0.14.0, 24 episodes x 7 days):
+  - dp_optimum could not HOLD stored energy (it always discharged into any deficit),
+    so "perfect forecast" already landed BELOW its "optimum"; fixed (TAKE_FRACS).
+  - the old hold spent stored energy on cheap night shoulders ahead of dear
+    mornings; allocating it by merit order: production EUR 390.86 -> 378.18
+    (-3.2%), perfect forecast 388.79 -> 377.08, energy imported at >= 50 ct with an
+    empty fleet 39.0 -> 14.6 kWh. 22 of 24 weeks cheaper; the two dearer ones are
+    windy March weeks with forecast error (+EUR 0.10 / +0.06).
 """
 from __future__ import annotations
 
@@ -355,10 +364,13 @@ def dp_optimum(ep: Episode, levels: int = 2049, buy_steps: int = 25) -> float:
         for buy in buys:
             gain = np.clip(np.minimum(buy * eta, usable_cap - e_pv), 0.0, None)
             stored = e_pv + gain
-            take = np.minimum(np.minimum(deficit, stored), PER_BUCKET)
-            c = cost + gain / eta / 1000.0 * p + gain / 1000.0 * ECON.wear_ct + (deficit - take) / 1000.0 * p
-            ns = np.clip(np.floor((stored - take) / step - 1e-12).astype(int), 0, levels - 1)
-            np.minimum.at(nxt, ns, c)
+            can = np.minimum(np.minimum(deficit, stored), PER_BUCKET)
+            # holding stored energy through a cheaper deficit is a choice too
+            for frac in (sc.TAKE_FRACS if deficit > 0 else (1.0,)):
+                take = can * frac
+                c = cost + gain / eta / 1000.0 * p + gain / 1000.0 * ECON.wear_ct + (deficit - take) / 1000.0 * p
+                ns = np.clip(np.floor((stored - take) / step - 1e-12).astype(int), 0, levels - 1)
+                np.minimum.at(nxt, ns, c)
         cost = nxt
     final = cost - e / 1000.0 * terminal_value_ct(ep)
     return float(np.min(final[np.isfinite(final)]))

@@ -4,6 +4,8 @@ Run: python3 tests/test_arbitrage.py  |  pytest tests/test_arbitrage.py
 """
 import importlib.util
 import sys
+
+import pytest
 from pathlib import Path
 
 _base = Path(__file__).resolve().parents[1] / "custom_components" / "wattsmith"
@@ -74,9 +76,13 @@ def test_moderate_peak_not_profitable():
 
 def test_defers_when_a_cheaper_window_can_cover_the_whole_need():
     # An 8-ct bucket sits before a 35-ct deficit small enough for one charge
-    # bucket to cover -> wait for it and name it, don't buy at 12 ct now.
+    # bucket to cover -> wait for it and name it, don't buy at 12 ct now. The
+    # fleet starts at the floor: with energy stored, keeping it for the 35-ct
+    # bucket beats buying at all (see test_keeps_stored_energy_for_the_dear_bucket).
+    at_floor = BatteryModel(soc_pct=11.0, capacity_wh=15360.0, min_soc=11.0,
+                            max_soc=80.0, charge_power_w=7500.0)
     buckets = [Bucket(12, 0, 500), Bucket(8, 0, 500), Bucket(35, 0, 1200)]
-    plan = plan_arbitrage(buckets, BAT, ECON)
+    plan = plan_arbitrage(buckets, at_floor, ECON)
     assert plan.grid_charge_now_wh == 0.0
     assert plan.buy_idx == 1 and plan.next_need_idx == 2
     assert "waiting" in plan.reason
@@ -180,10 +186,45 @@ def test_deficit_is_already_net_of_stored_energy_so_it_is_not_subtracted_twice()
     assert padded.grid_charge_now_wh >= plan0.grid_charge_now_wh
 
 
+def test_keeps_stored_energy_for_the_dear_bucket():
+    # 1.38 kWh stored covers the 35-ct bucket on its own: keep it for that and
+    # import the 12/8-ct buckets directly, rather than spend it cheap and buy
+    # it back at 8 ct / eta + wear.
+    buckets = [Bucket(12, 0, 500), Bucket(8, 0, 500), Bucket(35, 0, 1200)]
+    plan = plan_arbitrage(buckets, BAT, ECON)
+    assert plan.grid_charge_now_wh == 0.0 and plan.buy_idx is None
+    # 1380 of the 1382 Wh stored is kept (1200 Wh + the 15% forecast pad)
+    assert plan.hold_floor_soc == pytest.approx(BAT.soc_pct, abs=0.05)
+
+
+def test_holds_through_a_shoulder_for_a_dearer_morning():
+    # The case that motivated the stored-energy hold: 34 ct night shoulder, 45 ct
+    # morning, fleet too small for both. Buying at 34 for 45 does not clear
+    # 34/eta + wear, but SPENDING stored energy at 34 instead of 45 is still a loss.
+    fleet = BatteryModel(soc_pct=25.0, capacity_wh=15360.0, min_soc=11.0,
+                         max_soc=80.0, charge_power_w=7500.0)
+    buckets = _flat([34] * 12 + [45] * 12, load=250.0)
+    plan = plan_arbitrage(buckets, fleet, ECON)
+    assert plan.grid_charge_now_wh == 0.0
+    assert plan.hold_floor_soc == pytest.approx(fleet.soc_pct, abs=0.01)
+
+
+def test_does_not_hold_for_a_peak_a_later_trough_refills():
+    # 36 ct now, a 15 ct trough, then a 45 ct peak: the trough will refill for
+    # the peak, so stored energy is worth more spent now than kept.
+    fleet = BatteryModel(soc_pct=25.0, capacity_wh=15360.0, min_soc=11.0,
+                         max_soc=80.0, charge_power_w=7500.0)
+    buckets = _flat([36] * 4 + [15] * 8 + [45] * 8, load=250.0)
+    plan = plan_arbitrage(buckets, fleet, ECON)
+    assert plan.hold_floor_soc < fleet.soc_pct - 1.0
+
+
 def test_forecast_margin_raises_hold_floor():
     charged = BatteryModel(soc_pct=60.0, capacity_wh=15360.0, min_soc=11.0,
                            max_soc=80.0, charge_power_w=7500.0)
-    buckets = _flat([12] + [35] * 6, load=2000.0)
+    # need (6 kWh) below the stored 7.5 kWh, so the pad — not the fleet size —
+    # decides how much is kept
+    buckets = _flat([12] + [35] * 3, load=2000.0)
     padded = plan_arbitrage(buckets, charged, ECON)  # default 15% margin
 
     zero_margin = Econ(eta=0.78, wear_ct=3.26, min_margin_ct=1.5, forecast_margin_frac=0.0)
@@ -191,7 +232,7 @@ def test_forecast_margin_raises_hold_floor():
 
     assert padded.hold_floor_soc > unpadded.hold_floor_soc
     # padding only affects the reservation, not the reported raw forecast deficit
-    assert padded.profitable_deficit_wh == unpadded.profitable_deficit_wh
+    assert padded.profitable_deficit_wh == pytest.approx(unpadded.profitable_deficit_wh)
 
 
 def test_build_buckets_aligns_and_bounds_horizon():

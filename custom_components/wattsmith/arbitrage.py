@@ -12,8 +12,10 @@ Principles (docs/GRID_ARBITRAGE_AND_HISTORY_DB.md, Part A):
   - a stored kWh is only worth charging at the current price if some future
     deficit's price beats effective cost (price/η + wear + margin);
   - don't charge now if a cheaper window exists before the earliest deficit;
-  - protect earmarked energy from leaking into cheaper intermediate deficits
-    (the discharge hold);
+  - protect stored energy from leaking into cheaper intermediate deficits
+    (the discharge hold). What a stored kWh cost is sunk: keeping it is worth it
+    whenever a later need is dearer than now, NOT only when buying for it would
+    clear price/η + wear;
   - bounded by max-SOC (charge) and min-SOC (discharge) and any import cap.
 
 Rolling: recomputed every tick; only the current-window action is acted on.
@@ -236,12 +238,12 @@ def _forward_sim(
     START of bucket i — which says whether a purchase can physically be carried
     from a buy bucket through to the deficit it serves.
 
-    NOTE (open question, hel-129): `deficits` is the residue AFTER the battery
-    discharges, so a well-stocked fleet reports none and the discharge hold sized
-    from it collapses to the floor exactly when there is most worth protecting.
-    Sizing the hold on what the battery is scheduled to DELIVER instead was tried
-    and measured WORSE across the 30 synthetic + 8 historical scenarios (+0.36%
-    vs +0.26% regret), so it is deliberately not done. Revisit with real winter data.
+    Only answers "will the fleet run short?" (forecast_deficit_wh). The planner
+    no longer sizes its hold or its purchases from this chronological residue: a
+    well-stocked fleet reports no deficit, so a hold sized from it collapsed to the
+    floor exactly when there was most worth protecting. hel-129 once measured the
+    alternative as worse, but against a DP oracle that could not hold energy
+    either (it always discharged into any deficit); see _allocate_stored.
     """
     soc_e = usable_now
     deficits: list[tuple[int, float, float]] = []
@@ -259,6 +261,74 @@ def _forward_sim(
             if net - take > 1.0:
                 deficits.append((i, b.price_ct, net - take))
     return deficits, trace
+
+
+def _allocate_stored(
+    buckets: list[Bucket], usable_now: float, cap_usable: float,
+    pv_charge_limit_wh: float, discharge_limit_wh: float, econ: Econ, pad: float,
+) -> tuple[list[float], list[float], list[float]]:
+    """Merit-order plan for the energy the fleet already has (plus free PV).
+
+    Returns (alloc, worth, trace): alloc[i] is the stored energy earmarked for
+    bucket i, worth[i] what serving bucket i from storage saves per kWh, and
+    trace[i] the usable energy held at the START of bucket i once those
+    allocations are spent — which a purchase must fit on top of.
+
+    Stored energy is not bought again: η and wear are paid whenever it is
+    discharged, so the only question is WHERE a kWh saves most. Serving bucket i
+    from storage saves its price — unless an earlier profitable purchase could
+    serve it anyway, in which case it saves only that purchase's effective cost
+    (keeping a kWh for a peak that a later trough will refill is worth little).
+    Needs are served in descending `worth`, each capped by what can still be
+    carried to it: removing x at bucket i lowers every later level by x, less any
+    PV that would have been clipped at max-SOC and now fits.
+
+    Replaces sizing the hold on the chronological residue (_forward_sim), which
+    collapsed the hold to the floor as soon as the fleet held enough — and then
+    spent energy bought at 14 ct on 14 ct buckets ahead of a 46 ct peak.
+    """
+    n = len(buckets)
+    need = [max(0.0, b.load_wh - b.pv_wh) for b in buckets]
+    surplus = [min(max(0.0, b.pv_wh - b.load_wh), pv_charge_limit_wh) for b in buckets]
+    worth: list[float] = []
+    cheapest_before = float("inf")
+    for b in buckets:
+        buy = effective_cost_ct(cheapest_before, econ.eta, econ.wear_ct)
+        worth.append(buy if b.price_ct >= buy + econ.min_margin_ct else b.price_ct)
+        cheapest_before = min(cheapest_before, b.price_ct)
+    alloc = [0.0] * n
+    for i in sorted((k for k in range(n) if need[k] > 0), key=lambda k: -worth[k]):
+        # the pad reserves extra ENERGY for a forecast miss; it cannot add power
+        want = min(need[i], discharge_limit_wh) * (pad if i >= 1 else 1.0)
+        take = min(want, _removable(usable_now, surplus, alloc, cap_usable, i))
+        if take > 1.0:
+            alloc[i] += take
+    lvl, _clip = _levels(usable_now, surplus, alloc, cap_usable)
+    return alloc, worth, lvl[:n]
+
+
+def _levels(start: float, surplus: list[float], alloc: list[float],
+            cap_usable: float) -> tuple[list[float], list[float]]:
+    """Usable-energy levels (lvl[k] = start of bucket k) and the PV clipped at max-SOC."""
+    lvl, clip = [start], []
+    for k in range(len(surplus)):
+        u = lvl[k] + surplus[k] - alloc[k]
+        clip.append(max(0.0, u - cap_usable))
+        lvl.append(min(cap_usable, u))
+    return lvl, clip
+
+
+def _removable(start: float, surplus: list[float], alloc: list[float],
+               cap_usable: float, at: int) -> float:
+    """Most energy that can leave the fleet in bucket `at` (-1 = before bucket 0)
+    with every allocation still served. Every later level drops by that much,
+    less any PV that was being clipped at max-SOC and now fits."""
+    lvl, clip = _levels(start, surplus, alloc, cap_usable)
+    avail, absorbed = lvl[at + 1], 0.0
+    for k in range(at + 1, len(surplus)):
+        absorbed += clip[k]
+        avail = min(avail, lvl[k + 1] + absorbed)
+    return max(0.0, avail)
 
 
 def forecast_deficit_wh(buckets: list[Bucket], bat: BatteryModel) -> float | None:
@@ -282,6 +352,34 @@ def forecast_deficit_wh(buckets: list[Bucket], bat: BatteryModel) -> float | Non
     return sum(wh for _i, _p, wh in deficits)
 
 
+def _hold_floor(buckets: list[Bucket], bat: BatteryModel, econ: Econ,
+                alloc: list[float], worth: list[float], bought_now: float) -> float:
+    """Discharge floor (SOC %): keep what _allocate_stored earmarked for later
+    buckets where it saves more than spending it now would, plus anything bought
+    this bucket (it is bought for later; serving now from it pays η + wear for
+    nothing). Only the part of TODAY's stored energy those buckets depend on is
+    kept: a dear evening that midday PV will cover needs none of it."""
+    cap = bat.capacity_wh
+    usable_now = cap * max(0.0, bat.soc_pct - bat.min_soc) / 100.0
+    cap_usable = cap * max(0.0, bat.max_soc - bat.min_soc) / 100.0
+    charge_price = buckets[0].price_ct
+    hold_bar = charge_price + econ.min_margin_ct
+    dear = [a if (i >= 1 and worth[i] >= hold_bar) else 0.0 for i, a in enumerate(alloc)]
+    surplus = [min(max(0.0, b.pv_wh - b.load_wh), bat.charge_power_w * BUCKET_H)
+               for b in buckets]
+    spare = _removable(usable_now, surplus, dear, cap_usable, -1)
+    hold_e = max(0.0, usable_now - spare) + bought_now
+    hold_floor_soc = bat.min_soc + 100.0 * hold_e / cap
+    # Below the wear cost, cycling a kWh through the cells costs more than simply
+    # importing it — every Wh discharged now is a Wh of cell life spent to avoid a
+    # cheaper grid purchase. Freeze discharge outright rather than merely earmark.
+    # (Found by the scenario suite: a windy 3 ct night ran the whole house off the
+    # battery and paid 8.7 ct of wear to dodge 3 ct/kWh of grid energy.)
+    if charge_price < econ.wear_ct:
+        hold_floor_soc = 100.0          # a full hold = do not discharge at all
+    return hold_floor_soc
+
+
 def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> ArbitragePlan:
     """Decide the current-window grid-charge + discharge-hold. buckets[0] = now."""
     if not buckets or bat.capacity_wh <= 0:
@@ -294,24 +392,35 @@ def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> Arbi
     if econ.import_cap_w > 0:
         per_bucket_charge = min(per_bucket_charge, econ.import_cap_w * BUCKET_H)
 
-    # 1. PV-first forward sim -> every moment grid energy will be needed, and the
-    #    usable-energy trajectory that says what a purchase can be carried through.
-    deficits, trace = _forward_sim(
+    # 1. Earmark the stored energy (and free PV) where it saves most; what is
+    #    left over is every moment grid energy will be needed, and the level
+    #    trajectory says what a purchase can be carried through.
+    pad = 1.0 + econ.forecast_margin_frac
+    alloc, worth, trace = _allocate_stored(
         buckets, usable_now, cap_usable,
         pv_charge_limit_wh=bat.charge_power_w * BUCKET_H,
         discharge_limit_wh=bat.charge_power_w * BUCKET_H,
+        econ=econ, pad=pad,
     )
+    deficits: list[tuple[int, float, float]] = []
+    for i, b in enumerate(buckets):
+        net = b.load_wh - b.pv_wh
+        short = net - alloc[i] / (pad if i >= 1 else 1.0)   # raw, unpadded
+        if net > 0 and short > 1.0:
+            deficits.append((i, b.price_ct, short))
     charge_price = buckets[0].price_ct
     eff_now = effective_cost_ct(charge_price, econ.eta, econ.wear_ct)
     if not deficits:
-        return _idle(bat, "no deficit in the forecast horizon")
+        # Nothing to buy, but the stored energy is still earmarked: a load above
+        # forecast now must not eat what a dearer bucket later is counting on.
+        return ArbitragePlan(0.0, bat.soc_pct, _hold_floor(buckets, bat, econ, alloc, worth, 0.0),
+                             0.0, "no deficit in the forecast horizon")
 
     # 2. Merit order: cover the dearest need first, each from the cheapest moment
     #    that can actually serve it. The alternative to pre-buying is buying AT the
     #    need, so the gate compares need-price against that buy price through
     #    eta + wear. Morning and evening are the same case; nothing is special.
     purchases = [0.0] * len(buckets)
-    pad = 1.0 + econ.forecast_margin_frac
     matched: list[tuple[int, float, int, float, float]] = []  # need_i, p_need, buy_j, p_buy, wh
     for i, p_need, wh in sorted(deficits, key=lambda d: -d[1]):
         remaining = wh * pad
@@ -338,24 +447,13 @@ def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> Arbi
     first_need = min((i for i, _p, _j, _pb, _w in matched), default=None)
     need_price = next((p for i, p, _j, _pb, _w in matched if i == first_need), None)
 
-    # 3. Discharge hold — deliberately UNCHANGED from the live-verified version:
-    #    energy already stored is earmarked for any future deficit that beats the
-    #    cost of replacing it at today's price. This is about not spending cheap
-    #    what will be dear, and is independent of whether BUYING more is worth it.
-    earmark = [(i, p, wh) for (i, p, wh) in deficits
-               if i >= 1 and is_profitable(p, charge_price, econ.eta, econ.wear_ct,
-                                           econ.min_margin_ct)]
-    profitable_wh = sum(wh for _i, _p, wh in earmark)        # raw, unpadded
-    hold_e = min(usable_now, profitable_wh * pad)
-    hold_floor_soc = bat.min_soc + 100.0 * hold_e / cap
-    # Below the wear cost, cycling a kWh through the cells costs more than simply
-    # importing it — every Wh discharged now is a Wh of cell life spent to avoid a
-    # cheaper grid purchase. Freeze discharge outright rather than merely earmark.
-    # (Found by the scenario suite: a windy 3 ct night ran the whole house off the
-    # battery and paid 8.7 ct of wear to dodge 3 ct/kWh of grid energy.)
-    if charge_price < econ.wear_ct:
-        hold_floor_soc = 100.0          # a full hold = do not discharge at all
-
+    # 3. Discharge hold (see _hold_floor).
+    hold_floor_soc = _hold_floor(buckets, bat, econ, alloc, worth, min(purchases[0], headroom_now))
+    # The published need: future deficits dear enough to be worth BUYING for at
+    # today's price.
+    profitable_wh = sum(wh for (i, p, wh) in deficits
+                        if i >= 1 and is_profitable(p, charge_price, econ.eta, econ.wear_ct,
+                                                    econ.min_margin_ct))   # raw, unpadded
     if not matched:
         cheapest = min((b.price_ct for b in buckets), default=charge_price)
         return ArbitragePlan(

@@ -5,8 +5,9 @@ SCORES the planner: every scenario is run as a rolling simulation (re-plan each
 bucket, execute bucket 0's decision, advance — exactly how production behaves) and
 the resulting grid bill is compared against a clairvoyant dynamic-programming
 optimum for the same scenario. The DP is an independent implementation: it knows
-the whole future and searches the full charge/discharge space, so it is a true
-lower bound on cost.
+the whole future and searches the full charge/discharge space — including
+keeping stored energy through a cheap deficit for a dearer one — so it brackets
+the true optimum.
 
 The metric is REGRET: (planner_cost - optimal_cost) / optimal_cost. A rolling
 planner cannot beat a clairvoyant one, so regret >= 0 always; the question is how
@@ -180,13 +181,18 @@ def scenarios():
 
 
 # ------------------------------------------------------- clairvoyant optimum --
-def dp_bound(prices, pv, load, start_soc, mode="ceil", levels=2049, buy_steps=25):
+TAKE_FRACS = (0.0, 0.25, 0.5, 0.75, 1.0)
+
+
+def dp_bound(prices, pv, load, start_soc, mode="ceil", levels=8193, buy_steps=25):
     """Clairvoyant optimum for one scenario, in EUR-cent. Vectorised over states.
 
     State = stored usable energy on a fixed grid. Per bucket: PV surplus charges
     for free, any amount of grid energy may be bought into the battery (paying
     price on the AC energy and wear on what lands in the cells), then the deficit
-    is served from storage with the remainder imported.
+    is served from storage with the remainder imported. How much of the deficit
+    storage serves is itself a choice (TAKE_FRACS): holding stored energy through
+    a cheap deficit to spend it on a dearer one later is part of the optimum.
 
     The state grid forces a rounding choice, and that choice decides which side of
     the true optimum the answer falls:
@@ -215,11 +221,13 @@ def dp_bound(prices, pv, load, start_soc, mode="ceil", levels=2049, buy_steps=25
             gain = np.clip(np.minimum(buy * ECON.eta, usable_cap - e_pv), 0.0, None)
             ac = gain / ECON.eta if ECON.eta else np.zeros_like(gain)
             stored = e_pv + gain
-            take = np.minimum(np.minimum(deficit, stored), PER_BUCKET)
-            c = (cost + ac / 1000.0 * p + gain / 1000.0 * ECON.wear_ct
-                 + (deficit - take) / 1000.0 * p)
-            ns = np.clip(rnd((stored - take) / step - 1e-12).astype(int), 0, levels - 1)
-            np.minimum.at(nxt, ns, c)
+            can = np.minimum(np.minimum(deficit, stored), PER_BUCKET)
+            for frac in (TAKE_FRACS if deficit > 0 else (1.0,)):
+                take = can * frac
+                c = (cost + ac / 1000.0 * p + gain / 1000.0 * ECON.wear_ct
+                     + (deficit - take) / 1000.0 * p)
+                ns = np.clip(rnd((stored - take) / step - 1e-12).astype(int), 0, levels - 1)
+                np.minimum.at(nxt, ns, c)
         cost = nxt
         if not np.isfinite(cost).any():
             return float("inf")
@@ -298,16 +306,12 @@ def test_synthetic_scenarios_near_optimal():
     # must land essentially on the clairvoyant optimum.
     assert total_got <= total_opt * 1.02, (
         f"aggregate {total_got:.1f} ct vs achievable {total_opt:.1f} ct")
-    # KNOWN GAPS, documented rather than tuned away:
-    #  - scenario 05 (a 3 ct windy night, i.e. a grid price BELOW the 3.26 ct/kWh
-    #    wear cost) runs ~28% over the achievable optimum, about 4 ct on the day.
-    #  - historical 2026-09-04 (the darkest day) runs ~11%. Two hypotheses were
-    #    tested and REJECTED by measurement: raising min_margin_ct (made it worse
-    #    at every level 1.5/3/5/7 ct) and a terminal-energy artefact (the planner
-    #    ends that day at 0.00 kWh, so there is no leftover to explain it).
-    # Both are thin-spread / sub-wear regimes, which is exactly winter — worth
-    # revisiting once real winter data exists.
-    assert worst <= 0.30, f"worst-case regret {worst*100:.1f}% exceeds 30%"
+    # The old "known gaps" (scenario 05 at +28%, historical 2026-09-04 at +11%)
+    # were the discharge hold spending stored energy on cheap buckets ahead of dear
+    # ones — hidden while this DP could not hold energy either. With the oracle
+    # able to hold (TAKE_FRACS) and the planner allocating stored energy by merit
+    # order, both sit on the optimum.
+    assert worst <= 0.05, f"worst-case regret {worst*100:.1f}% exceeds 5%"
 
 
 def test_planner_never_buys_when_pv_covers_everything():
@@ -346,9 +350,9 @@ def test_historical_days_near_optimal():
     worst = _report(rows, "HISTORICAL DAYS (real prices, PV and load from the history DB)")
     total_got = sum(g for _n, g, _o in rows)
     total_opt = sum(o for _n, _g, o in rows)
-    assert total_got <= total_opt * 1.05, (
+    assert total_got <= total_opt * 1.02, (
         f"aggregate {total_got:.1f} ct vs achievable {total_opt:.1f} ct")
-    assert worst <= 0.30, f"worst-case regret {worst*100:.1f}% exceeds 30%"
+    assert worst <= 0.05, f"worst-case regret {worst*100:.1f}% exceeds 5%"
 
 
 if __name__ == "__main__":
