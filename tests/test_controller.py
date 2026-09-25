@@ -144,9 +144,16 @@ def _feed(c, grids, bats, t0=0.0, dt=5.0):
     return out
 
 
+def _feed_needs(c, needs, bats, t0=0.0, dt=5.0):
+    """1:1 plant: `needs` is the battery power that would put the grid on target."""
+    for i, n in enumerate(needs):
+        c.update(n - c._command_total + c.config.target_grid_w, bats, now=t0 + i * dt)
+
+
 def test_pulsing_load_is_detected_and_held_at_the_peak():
     c = _pulse_ctrl()
     bats = _bats([60, 60, 60])
+    c._command_total = 1500.0                  # discharging: no PV surplus in play
     # a load flipping +1000 / -1000 W around the target every sample
     _feed(c, [1000, -1000, 1000, -1000, 1000, -1000], bats)
     assert c.pulsing
@@ -223,6 +230,106 @@ def test_replay_induction_hob_import_drops_with_pulse_hold():
     chase, hold = replay(False), replay(True)
     assert chase > 20, chase                     # the flip-flop really imports
     assert hold < 0.3 * chase, (hold, chase)    # pulse hold removes most of it
+
+def _burst_load(seed=25, until=900.0):
+    """2026-09-25 10:05-10:15 (washing machine + mixer + stove while PV charged the
+    fleet): ~1.05 kW base with bursts of +1.4-2.5 kW lasting 5-15 s (mostly 5-6 s),
+    starting every 11-34 s — the spread measured from house_consumption_power."""
+    import random
+    rng, out, t = random.Random(seed), [], -60.0
+    while t < until:
+        t += rng.uniform(11, 34)
+        out.append((t, t + rng.choice([5, 5, 5, 6, 6, 10, 15]), rng.uniform(1400, 2500)))
+    return lambda now: 1050.0 + sum(a for s, e, a in out if s <= now < e)
+
+
+def _replay(load, pv_w=0.0, hold=False, hold_charge=False, until=900.0):
+    """Real controller vs a lagging battery: grid sampled every 5 s, the manager acts
+    every 3 s on a new sample, the fleet follows after ~1 s with a ~6 s ramp (tau
+    2.5 s). Returns Wh per hour: (import, export, charged)."""
+    import math
+    c = _pulse_ctrl(hold)
+    c.config.pulse_hold_charge = hold_charge
+    c.config.target_grid_w = -60
+    bats = [BatteryState(id="fleet", soc=60, min_soc=11, max_power=7500)]
+    dt, t = 0.1, -60.0
+    b = tb = load(t) - pv_w
+    sample_t = seen = sample = None
+    next_sample = next_tick = -60.0
+    pending, imp, exp, chg = [], 0.0, 0.0, 0.0
+    while t < until:
+        if t >= next_sample:
+            sample, sample_t, next_sample = load(t) - pv_w - b, t, next_sample + 5.0
+        if t >= next_tick:
+            next_tick += 3.0
+            if sample_t is not None and sample_t != seen:
+                seen = sample_t
+                pending.append((t + 1.0, sum(c.update(sample, bats, now=t).values())))
+        while pending and pending[0][0] <= t:
+            tb = pending.pop(0)[1]
+        b += (tb - b) * (1 - math.exp(-dt / 2.5))
+        g = load(t) - pv_w - b
+        if t >= 0:
+            imp += max(0.0, g) * dt / 3600
+            exp += max(0.0, -g) * dt / 3600
+            chg += max(0.0, -b) * dt / 3600
+        t += dt
+    h = until / 3600
+    return imp / h, exp / h, chg / h
+
+
+def test_bursts_every_20_to_30_s_are_detected():
+    # the hob pulses every 7 s; these bursts only every ~25 s, so a 30 s window saw
+    # 1-2 reversals and never switched on. 60 s sees them.
+    c = _pulse_ctrl(False)
+    bats = _bats([60, 60, 60])
+    _feed_needs(c, ([-500] + [-2000] * 4) * 4, bats)     # a 5 s burst every 25 s
+    assert c.pulsing
+
+
+def test_charge_hold_caps_the_charge_rate_through_bursts():
+    c = _pulse_ctrl(False)
+    c.config.pulse_hold_charge = True
+    bats = _bats([60, 60, 60])
+    _feed_needs(c, [-2000, -500] * 5, bats)            # charging, bursts every 10 s
+    assert c.pulsing and c.hold_mode == "charge"
+    assert c.hold_floor_w == -500.0                     # charge at most 500 W through them
+    _feed_needs(c, [-2000], bats, t0=50.0)              # a gap: would charge 2 kW again
+    assert c._command_total >= -500.0 - 1               # held, not chased
+
+
+def test_charge_hold_without_discharge_permission_never_forces_discharge():
+    # bursts that would need discharge, but stored energy is not in surplus: the
+    # charge hold may stop charging (floor 0) but never holds discharge up — the
+    # loop still covers a burst the ordinary way, as without any hold
+    c = _pulse_ctrl(False)
+    c.config.pulse_hold_charge = True
+    bats = _bats([60, 60, 60])
+    _feed_needs(c, [-1500, 600] * 5, bats)
+    assert c.hold_mode == "charge" and c.hold_floor_w == 0.0
+
+
+def test_surplus_alone_never_stops_pv_charging():
+    # v0.13 held a positive floor whenever a burst briefly needed discharge, which
+    # stopped PV charging outright; now any PV in the window needs the PV gate
+    c = _pulse_ctrl(True)
+    bats = _bats([60, 60, 60])
+    _feed_needs(c, [-1500, 600] * 5, bats)
+    assert c.pulsing and c.hold_mode is None
+
+
+def test_replay_bursts_while_charging_import_drops_with_charge_hold():
+    load = _burst_load()
+    chase = _replay(load, pv_w=3000.0)
+    gate_closed = _replay(load, pv_w=3000.0, hold=True)          # surplus, but PV not assured
+    held = _replay(load, pv_w=3000.0, hold=True, hold_charge=True)
+    assert chase[0] > 300, chase                     # the flip-flop really imports
+    # stored energy in surplus alone must not stop PV charging (v0.13 did, whenever a
+    # burst briefly needed discharge): without the PV gate it charges as before
+    assert abs(gate_closed[2] - chase[2]) < 0.02 * chase[2], (gate_closed, chase)
+    assert held[0] < 0.2 * chase[0], (held, chase)   # the charge hold removes most of it
+    assert held[2] < chase[2]                        # paid for in PV held back (hence the gate)
+
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

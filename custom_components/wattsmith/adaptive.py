@@ -136,3 +136,12 @@ def plan_adaptive_ceiling(
         headroom_wh=headroom_wh,
         fleet_headroom_wh=fleet_headroom_wh,
     )
+
+
+def pv_fills_fleet(result: AdaptiveResult, reserve_wh: float) -> bool:
+    """True when the remaining sun fills the fleet to the ceiling with `reserve_wh` to
+    spare — PV held back now then only exports earlier, not instead of charging.
+    False whenever adaptive charging has nothing to go on (disabled, no forecast,
+    outside the PV window): the numbers are zero then."""
+    return (result.status in (STATUS_CHARGING, STATUS_HOLDING)
+            and result.remaining_surplus_wh >= result.fleet_headroom_wh + reserve_wh)

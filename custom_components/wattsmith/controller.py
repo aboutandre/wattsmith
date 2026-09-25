@@ -59,9 +59,18 @@ class ControllerConfig:
     # held at the highest demand of the last `pulse_hold_s`: the on-pulses are
     # covered from the battery and the off-pulses export instead. The manager sets
     # `pulse_hold` each tick (switch on AND stored energy is in surplus).
+    #
+    # While CHARGING from PV the same bursts (washing-machine heater, mixer, stove,
+    # 5-15 s on every 15-30 s, 2026-09-25) make the charge rate chase them: every
+    # burst imports until the batteries back off, then the late back-off exports.
+    # `pulse_hold_charge` (switch on AND the remaining sun will fill the fleet to its
+    # ceiling anyway) holds the charge rate at its LOWEST of the last `pulse_hold_s`
+    # instead, so the bursts are covered by PV. The PV this holds back only exports
+    # earlier than it would have at the top of the charge, so nothing is lost.
     pulse_hold: bool = False
-    pulse_hold_s: float = 20.0         # hold the peak demand this long
-    pulse_detect_s: float = 30.0       # look for pulsing over this window
+    pulse_hold_charge: bool = False
+    pulse_hold_s: float = 30.0         # hold the peak demand this long (bursts come every 11-34 s)
+    pulse_detect_s: float = 60.0       # look for pulsing over this window (catches 15-30 s cycles)
     pulse_min_step_w: float = 300.0    # a demand step at least this big counts
     pulse_min_reversals: int = 3       # up/down reversals within the window = pulsing
 
@@ -77,7 +86,8 @@ class ZeroGridController:
     # (time, battery power that would have met the target) — for pulse detection
     _needs: list = field(default_factory=list)
     pulsing: bool = False         # published: is a pulsing load being detected?
-    hold_floor_w: float = 0.0     # published: current pulse-hold floor (0 = not holding)
+    hold_floor_w: float = 0.0     # published: current pulse-hold floor (W, - = charge capped)
+    hold_mode: str | None = None  # published: None, "discharge" or "charge"
 
     def reset(self) -> None:
         self._command_total = 0.0
@@ -86,6 +96,7 @@ class ZeroGridController:
         self._needs = []
         self.pulsing = False
         self.hold_floor_w = 0.0
+        self.hold_mode = None
 
     def _pulse_floor(self, need: float, now: float | None) -> float | None:
         """Record demand; return the hold floor while a pulsing load is detected."""
@@ -103,17 +114,28 @@ class ZeroGridController:
         # the count dips below 3 now and then; dropping the hold on each dip gave back
         # a third of the benefit in the replay.
         self.pulsing = reversals >= (1 if self.pulsing else cfg.pulse_min_reversals)
-        if not (cfg.pulse_hold and self.pulsing):
-            self.hold_floor_w = 0.0
+        if not (self.pulsing and (cfg.pulse_hold or cfg.pulse_hold_charge)):
+            self.hold_floor_w, self.hold_mode = 0.0, None
             return None
-        peak = max(n for t, n in self._needs if now - t <= cfg.pulse_hold_s)
-        if peak <= 0:
-            # the pulses ride on a PV surplus: nothing to cover from the battery, and a
-            # floor of 0 would stop it charging and export the PV instead
-            self.hold_floor_w = 0.0
+        window = [n for t, n in self._needs if now - t <= cfg.pulse_hold_s]
+        peak = max(window)
+        if min(window) < 0:
+            # PV is charging the fleet at least part of the time: any floor holds that
+            # charging back, so only when the remaining sun fills the fleet anyway.
+            # Charge no faster than the least of the window; a burst that needs
+            # discharge is covered from the battery only if stored energy is in surplus.
+            if not cfg.pulse_hold_charge:
+                self.hold_floor_w, self.hold_mode = 0.0, None
+                return None
+            floor = peak if cfg.pulse_hold else min(peak, 0.0)
+        elif cfg.pulse_hold:
+            floor = peak                        # discharging throughout: hold it up
+        else:
+            self.hold_floor_w, self.hold_mode = 0.0, None
             return None
-        self.hold_floor_w = peak                # only ever holds DISCHARGE up
-        return peak
+        self.hold_floor_w = floor               # a floor on the command: never adds charging
+        self.hold_mode = "discharge" if floor > 0 else "charge"
+        return floor
 
     def update(self, grid_power: float, batteries: list[BatteryState],
                now: float | None = None) -> dict[str, int]:

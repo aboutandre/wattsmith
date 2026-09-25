@@ -130,6 +130,25 @@ def test_never_lowers_cap():
         assert r.effective_max_soc >= CAP
 
 
+# ── pulse hold while charging: does the remaining sun fill the fleet anyway? ──
+def test_pv_fills_fleet_when_the_sun_covers_the_headroom_with_reserve():
+    # 70% of FLEET_WH, ceiling 100%: 30% to fill; plenty of sun left
+    r = plan(_obs(remaining_pv_wh=FLEET_WH * 0.30 + 5000.0), _cfg())
+    assert adaptive.pv_fills_fleet(r, 2000.0)
+
+
+def test_pv_does_not_fill_fleet_without_the_reserve():
+    r = plan(_obs(remaining_pv_wh=FLEET_WH * 0.30 + 1000.0), _cfg())
+    assert not adaptive.pv_fills_fleet(r, 2000.0)
+
+
+def test_pv_fills_fleet_is_false_without_adaptive_data():
+    # disabled, no forecast or after sunset: the numbers are zero, never "fills"
+    assert not adaptive.pv_fills_fleet(plan(_obs(), _cfg(enabled=False)), 0.0)
+    assert not adaptive.pv_fills_fleet(plan(_obs(remaining_pv_wh=None), _cfg()), 0.0)
+    assert not adaptive.pv_fills_fleet(plan(_obs(hours_to_sunset=0.0), _cfg()), 0.0)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

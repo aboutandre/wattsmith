@@ -24,7 +24,13 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from .adaptive import AdaptiveConfig, AdaptiveObservation, AdaptiveResult, plan_adaptive_ceiling
+from .adaptive import (
+    AdaptiveConfig,
+    AdaptiveObservation,
+    AdaptiveResult,
+    plan_adaptive_ceiling,
+    pv_fills_fleet,
+)
 from .baseline_learner import BaselineLearner
 from .battery_bridge import BatteryBridge
 from .const import (
@@ -83,6 +89,7 @@ from .settings import (
     MANAGER_RESEND_S,
     MANAGER_TICK_S,
     DEFAULT_PULSE_HOLD_ENABLED,
+    PULSE_CHARGE_RESERVE_WH,
 )
 from .controller import ControllerConfig, ZeroGridController
 from .planner import BatteryReading, DispatchPlanner, Observation, Plan, PlannerConfig
@@ -127,6 +134,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         # Pulse hold state (published on status).
         self._pulse_hold_enabled = DEFAULT_PULSE_HOLD_ENABLED
         self._energy_surplus = False
+        self._pv_fills_fleet = False
         # True while actively grid-charging for arbitrage (published on status).
         self._arb_charging: bool = False
 
@@ -551,6 +559,10 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             self._pulse_hold_enabled = bool(self._opt(CONF_PULSE_HOLD_ENABLED, DEFAULT_PULSE_HOLD_ENABLED))
             self._energy_surplus = self._arb_energy_surplus()
             self.controller.config.pulse_hold = self._pulse_hold_enabled and self._energy_surplus
+            # ...and while charging from PV, cap the charge rate through the bursts
+            # instead, but only if the remaining sun fills the fleet anyway.
+            self._pv_fills_fleet = pv_fills_fleet(self._adaptive, PULSE_CHARGE_RESERVE_WH)
+            self.controller.config.pulse_hold_charge = self._pulse_hold_enabled and self._pv_fills_fleet
             self._calibrating = self._arb_calibration_open_ceiling()
             if self._calibrating:
                 self.planner.config.max_battery_soc = 100.0
@@ -634,7 +646,9 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             "pulse_hold": {
                 "enabled": self._pulse_hold_enabled,
                 "energy_surplus": self._energy_surplus,
+                "pv_fills_fleet": self._pv_fills_fleet,
                 "pulsing_load": self.controller.pulsing,
+                "hold_mode": self.controller.hold_mode,
                 "holding_w": round(self.controller.hold_floor_w),
             },
             "safety": self.supervisor.status(now),

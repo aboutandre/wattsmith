@@ -28,15 +28,18 @@ from .settings import (
 # Plain-language intent, published as each switch's `purpose` attribute so the
 # more-info dialog explains what the toggle does long after it was set up.
 PURPOSE_PULSE_HOLD = (
-    "Stops the import/export flip-flop caused by loads that switch on and off every few "
-    "seconds (induction hob). The batteries need ~7 s to follow a new command, so they "
-    "cannot track a 3.5 s pulse: without this, every on-pulse imports and every off-pulse "
-    "exports. While such pulsing is detected, the battery output is held at the peak "
-    "demand of the last 20 s: the house draws nothing from the grid and the gaps are "
-    "exported instead. Only active while stored energy is in SURPLUS (the forecast sees no "
-    "shortfall before the batteries refill), because exported battery energy only earns the "
-    "feed-in price. Replay of 2026-09-22: grid import -85% while cooking. "
-    "ON = allowed (still waits for pulsing + surplus); OFF = always chase the load."
+    "Stops the import/export flip-flop caused by loads that switch on and off faster than "
+    "the batteries can follow (induction hob, washing-machine heater, mixer, stove). The "
+    "batteries need ~7 s to follow a new command, so they cannot track a 3.5 s pulse or a "
+    "5-15 s burst: without this, every burst imports and the late reaction exports. While "
+    "such pulsing is detected (3 up/down swings within 60 s), the command is held at the "
+    "highest demand of the last 30 s. When the bursts need DISCHARGE, the battery output is "
+    "held up, only while stored energy is in SURPLUS (the forecast sees no shortfall before "
+    "the batteries refill), because exported battery energy only earns the feed-in price. "
+    "When the batteries are CHARGING from PV, the charge rate is held down instead so solar "
+    "covers the bursts, only while the remaining sun still FILLS the batteries to their "
+    "ceiling (with ~2 kWh to spare), so the held-back PV would have been exported anyway. "
+    "ON = allowed (still waits for pulsing + its gate); OFF = always chase the load."
 )
 PURPOSE_CALIBRATION = (
     "The Marstek battery's SOC reading drifts below reality by ~1.3 points per kWh it "
@@ -253,8 +256,12 @@ class PulseHoldSwitch(OptionSwitch):
             "purpose": self._purpose,
             # is the stored energy in surplus right now (the gate)?
             "energy_surplus": live.get("energy_surplus"),
+            # will the remaining sun fill the batteries anyway (the gate while charging)?
+            "pv_fills_fleet": live.get("pv_fills_fleet"),
             # is a pulsing load being detected right now?
             "pulsing_load": live.get("pulsing_load"),
-            # battery output currently held (W); 0 = not holding
+            # None, "discharge" (output held up) or "charge" (charge rate held down)
+            "hold_mode": live.get("hold_mode"),
+            # the held command (W): + = discharge floor, - = charge capped at this
             "holding_w": live.get("holding_w"),
         }

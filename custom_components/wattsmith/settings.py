@@ -37,6 +37,12 @@ MANAGER_DEGRADED_THRESHOLD: Final[int] = 3    # consecutive missed acks before "
 # Replay of 2026-09-22 17:18: import -85%; saves ~7-8 ct per cooking hour with
 # surplus energy, would cost ~5-6 ct/h if the energy were scarce (hence the gate).
 DEFAULT_PULSE_HOLD_ENABLED: Final[bool] = True
+# While CHARGING, bursts (washing machine, mixer, stove: 5-15 s every 15-30 s,
+# 2026-09-25) are held off the grid by capping the charge rate, which holds back
+# ~0.7 kWh/h of PV. Only done when the remaining sun still fills the fleet to its
+# ceiling with this much to spare (~3 h of bursts), so the held-back PV would have
+# been exported at the top of the charge anyway.
+PULSE_CHARGE_RESERVE_WH: Final[float] = 2000.0
 
 # === Controller (PD) defaults ================================================
 DEFAULT_TARGET_GRID_W: Final[int] = -50
