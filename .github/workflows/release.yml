@@ -1,0 +1,43 @@
+# Publishes a GitHub release (which is what HACS installs) whenever the version in
+# manifest.json changes on main.
+#
+# Choosing the version stays manual: whoever makes the change bumps "version" in
+# custom_components/wattsmith/manifest.json (SemVer: fix -> patch, new or changed
+# behaviour -> minor, breaking config/entities -> major), usually together with
+# release-notes/v<version>.md. The first "# " line of that file is the release
+# title and the rest is the body. This workflow only does the mechanical part:
+# tag v<version> on main and publish the release.
+#
+# It publishes nothing when the version did not change, when v<version> is
+# already released, or when the version is lower than the latest tag (that fails
+# the job, since it is a mistake). Run it by hand (workflow_dispatch) to publish
+# the version currently on main if it is not released yet.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [custom_components/wattsmith/manifest.json]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Publish the manifest version if it is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: bash .github/workflows/release.sh
