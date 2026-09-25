@@ -61,6 +61,9 @@ DEFAULT_MAX_BATTERY_POWER: Final[int] = 2500
 DEFAULT_ADAPTIVE_CEILING_SOC: Final[float] = 100.0
 DEFAULT_ADAPTIVE_BASELINE_W: Final[float] = 500.0   # fallback until learner has enough data
 DEFAULT_ADAPTIVE_FORECAST_DERATE: Final[float] = 0.9
+# Once the ceiling is open it only closes again when the remaining surplus exceeds
+# the cap->ceiling headroom by this much (~4x the 5-minute Solcast wobble).
+ADAPTIVE_HYSTERESIS_WH: Final[float] = 1000.0
 DEFAULT_SUN_SENSOR: Final[str] = "sun.sun"
 
 # Baseline learner — rolling per-hour-of-day house-load averager.

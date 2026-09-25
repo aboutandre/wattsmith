@@ -149,6 +149,42 @@ def test_pv_fills_fleet_is_false_without_adaptive_data():
     assert not adaptive.pv_fills_fleet(plan(_obs(hours_to_sunset=0.0), _cfg()), 0.0)
 
 
+# ── hysteresis: forecast wobble around the threshold must not toggle the ceiling ──
+HEADROOM = FLEET_WH * (100.0 - CAP) / 100.0     # cap -> ceiling
+
+
+def _at_surplus(surplus_wh, was_open, hysteresis_wh=1000.0):
+    return plan(_obs(remaining_pv_wh=surplus_wh, was_open=was_open),
+                _cfg(hysteresis_wh=hysteresis_wh))
+
+
+def test_opening_still_needs_surplus_within_headroom():
+    assert not _at_surplus(HEADROOM + 200.0, was_open=False).open
+    assert _at_surplus(HEADROOM - 200.0, was_open=False).open
+
+
+def test_once_open_it_stays_open_within_the_band():
+    assert _at_surplus(HEADROOM + 900.0, was_open=True).open
+    assert not _at_surplus(HEADROOM + 1100.0, was_open=True).open
+
+
+def test_noon_forecast_wobble_no_longer_toggles_the_ceiling():
+    # 2026-09-25 ~12:05: each 5-min Solcast refresh moved the surplus ~0.25 kWh
+    # around the headroom, and the ceiling went 80 -> 100 -> 80 -> 100
+    wobble = [HEADROOM + d for d in (150, -120, 180, -90, 210, -60, 240, 120, 300)]
+
+    def flips(hysteresis_wh):
+        was_open, n = False, 0
+        for surplus in wobble:
+            now_open = _at_surplus(surplus, was_open, hysteresis_wh).open
+            n += now_open != was_open
+            was_open = now_open
+        return n
+
+    assert flips(0.0) >= 5            # without hysteresis: toggles on every wobble
+    assert flips(1000.0) == 1         # with it: opens once and stays open
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

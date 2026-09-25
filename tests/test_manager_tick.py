@@ -334,3 +334,39 @@ if __name__ == "__main__":
         t()
         print(f"  PASS {t.__name__}")
     print(f"\n{len(tests)} manager tick tests passed ✓")
+
+
+# ── adaptive inputs: sunset roll-over and battery dropouts (2026-09-24) ───────
+def _sun(setting_in_h, rising_in_h, state="above_horizon"):
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    return SimpleNamespace(state=state, attributes={
+        "next_setting": now + timedelta(hours=setting_in_h),
+        "next_rising": now + timedelta(hours=rising_in_h)})
+
+
+def test_hours_to_sunset_normal_afternoon():
+    mgr = make_manager(states={"sun.sun": _sun(2.0, 13.0)})
+    assert 1.9 < mgr._hours_to_sunset() < 2.1
+
+
+def test_hours_to_sunset_is_zero_while_the_sun_entity_rolls_over():
+    # at sunset next_setting already points at tomorrow while the state still says
+    # above_horizon: that read as ~24 h of sun left and reopened the ceiling
+    mgr = make_manager(states={"sun.sun": _sun(23.9, 11.0)})
+    assert mgr._hours_to_sunset() == 0.0
+
+
+def test_a_battery_dropout_does_not_shrink_the_fleet():
+    mgr = make_manager(states={"sun.sun": _sun(3.0, 14.0),
+                               "sensor.solcast": SimpleNamespace(state="4.0")})
+    mgr.adaptive_enabled, mgr.solcast_sensor = True, "sensor.solcast"
+    mgr.max_battery_soc = 80.0                      # ceiling 100 must sit above the cap
+    full = [_bat("f9", 50.0), _bat("f10", 50.0, device="d2"), _bat("f11", 50.0, device="d3")]
+    before = mgr._eval_adaptive(full)
+    dropped = [_bat("f9", None, available=False, capacity=None),
+               _bat("f10", 50.0, device="d2"), _bat("f11", 50.0, device="d3")]
+    after = mgr._eval_adaptive(dropped)
+    assert before.status != "inactive", before.reason
+    assert after.fleet_headroom_wh == before.fleet_headroom_wh
+    assert after.headroom_wh == before.headroom_wh

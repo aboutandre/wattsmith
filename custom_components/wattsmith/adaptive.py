@@ -47,6 +47,10 @@ class AdaptiveConfig:
     forecast_derate: float = 0.9     # Solcast is generation, not surplus, and over-forecasts;
                                      # derate remaining-PV before using it
     min_hours_to_sunset: float = 0.1  # below this the PV window is effectively over
+    # Once open, stay open until the surplus exceeds the headroom by this much.
+    # Solcast refreshes every 5 min and moves the surplus by ~0.25 kWh, which
+    # flipped the ceiling 80 <-> 100% several times around noon on 2026-09-25.
+    hysteresis_wh: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -58,6 +62,7 @@ class AdaptiveObservation:
     fleet_capacity_wh: float         # Σ battery capacity (Wh)
     remaining_pv_wh: float | None    # Solcast remaining-today forecast (Wh)
     hours_to_sunset: float           # remaining PV window (h)
+    was_open: bool = False           # was the ceiling open on the previous tick?
 
 
 @dataclass(frozen=True)
@@ -115,7 +120,10 @@ def plan_adaptive_ceiling(
     # Latch: once the pack has climbed past the cap we keep the ceiling open for
     # the rest of the window so a forecast wobble can't slam it shut mid-climb.
     already_climbing = obs.fleet_soc > obs.cap_soc + 0.5
-    open_ceiling = already_climbing or remaining_surplus_wh <= headroom_wh
+    # Hysteresis: opening needs surplus <= headroom; staying open only needs it
+    # within headroom + hysteresis_wh, so forecast wobble can't toggle it.
+    open_ceiling = (already_climbing or remaining_surplus_wh <= headroom_wh
+                    or (obs.was_open and remaining_surplus_wh <= headroom_wh + cfg.hysteresis_wh))
 
     if open_ceiling:
         return AdaptiveResult(

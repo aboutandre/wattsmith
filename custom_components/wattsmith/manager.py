@@ -61,6 +61,7 @@ from .const import (
     CONF_PULSE_HOLD_ENABLED,
 )
 from .settings import (
+    ADAPTIVE_HYSTERESIS_WH,
     DEFAULT_ADAPTIVE_BASELINE_W,
     DEFAULT_ADAPTIVE_CEILING_SOC,
     DEFAULT_ADAPTIVE_FORECAST_DERATE,
@@ -129,6 +130,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         self._last_baseline_save: float = 0.0    # monotonic; save at most hourly
         # Latest adaptive decision (published for the Adaptive entities).
         self._adaptive: AdaptiveResult | None = None
+        self._battery_capacity_wh: dict[str, float] = {}
         # True while a calibration full charge is lifting the ceiling (published on status).
         self._calibrating = False
         # Pulse hold state (published on status).
@@ -364,7 +366,13 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
 
     def _eval_adaptive(self, states) -> AdaptiveResult:
         """Compute the effective Max Charge SOC for this tick from the fleet + forecast."""
-        fleet_cap = sum(s.capacity for s in states if s.capacity)
+        # A battery that misses one poll reports no capacity; remember each battery's
+        # last capacity so a dropout doesn't shrink the fleet (and its headroom) by a
+        # third for a minute (F9, 2026-09-24 19:20).
+        for s in states:
+            if s.capacity:
+                self._battery_capacity_wh[s.battery_id] = s.capacity
+        fleet_cap = sum(self._battery_capacity_wh.values())
         weighted = [(s.soc, s.capacity) for s in states if s.soc is not None and s.capacity]
         fleet_soc = (
             sum(soc * cap for soc, cap in weighted) / sum(cap for _, cap in weighted)
@@ -380,12 +388,14 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             fleet_capacity_wh=fleet_cap,
             remaining_pv_wh=self._read_remaining_pv_wh(),
             hours_to_sunset=self._hours_to_sunset(),
+            was_open=bool(self._adaptive and self._adaptive.open),
         )
         return plan_adaptive_ceiling(obs, AdaptiveConfig(
             enabled=self.adaptive_enabled,
             ceiling_soc=self.adaptive_ceiling_soc,
             baseline_load_w=baseline_w,
             forecast_derate=self.adaptive_forecast_derate,
+            hysteresis_wh=ADAPTIVE_HYSTERESIS_WH,
         ))
 
     def _read_remaining_pv_wh(self) -> float | None:
@@ -411,6 +421,15 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         elif not isinstance(nxt, datetime):
             nxt = None
         if nxt is None:
+            return 0.0
+        # Right at sunset the sun entity already reports TOMORROW's setting while its
+        # state still reads above_horizon for a few minutes. Above the horizon the
+        # next setting always comes before the next rising, so the reverse means the
+        # sun is setting now (2026-09-24 19:19: the ceiling reopened for 4 minutes).
+        rising = state.attributes.get("next_rising")
+        if isinstance(rising, str):
+            rising = dt_util.parse_datetime(rising)
+        if isinstance(rising, datetime) and nxt > rising:
             return 0.0
         return max(0.0, (nxt - dt_util.utcnow()).total_seconds() / 3600.0)
 
