@@ -370,3 +370,38 @@ def test_a_battery_dropout_does_not_shrink_the_fleet():
     assert before.status != "inactive", before.reason
     assert after.fleet_headroom_wh == before.fleet_headroom_wh
     assert after.headroom_wh == before.headroom_wh
+
+
+# ── Max Charge SOC as a soft cap (hel-140) ────────────────────────────────────
+def test_arbitrage_ceiling_lift_raises_the_charge_ceiling():
+    # the planner found buying above the 80% cap pays (PV alone would fill to 80%
+    # before the cheap window ends): the manager lets the fleet charge past it
+    mgr = make_manager({"max_battery_soc": 80.0}, {"sensor.grid": _grid_state(0)},
+                       [_bat(soc=70.0)])
+    arb = _fake_arb()
+    arb.ceiling_lift_soc = 100.0
+    mgr.hass.data.setdefault(DOMAIN, {})["mgr_entry_arb"] = arb
+    result = _tick(mgr)
+    assert mgr.planner.config.max_battery_soc == 100.0
+    assert result["ceiling_lift_soc"] == 100.0
+
+
+def test_without_a_lift_the_soft_cap_holds():
+    mgr = make_manager({"max_battery_soc": 80.0}, {"sensor.grid": _grid_state(0)},
+                       [_bat(soc=70.0)])
+    arb = _fake_arb()
+    arb.ceiling_lift_soc = None
+    mgr.hass.data.setdefault(DOMAIN, {})["mgr_entry_arb"] = arb
+    _tick(mgr)
+    assert mgr.planner.config.max_battery_soc == 80.0
+
+
+def test_ev_right_of_way_still_caps_a_lifted_ceiling():
+    mgr = make_manager({"max_battery_soc": 80.0}, {"sensor.grid": _grid_state(0)},
+                       [_bat(soc=70.0)])
+    arb = _fake_arb()
+    arb.ceiling_lift_soc = 100.0
+    mgr.hass.data.setdefault(DOMAIN, {})["mgr_entry_arb"] = arb
+    mgr._ev_solar_reserve_soc = lambda: 60.0
+    _tick(mgr)
+    assert mgr.planner.config.max_battery_soc == 60.0

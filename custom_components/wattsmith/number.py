@@ -105,7 +105,15 @@ EV_NUMBERS: tuple[EvNumberDesc, ...] = (
 
 NUMBERS: tuple[ManagerNumber, ...] = (
     ManagerNumber(CONF_TARGET_GRID_W, "Target Grid Power", -2000, 2000, 10, "W",
-                  "mdi:transmission-tower", lambda c: c.controller.config.target_grid_w),
+                  "mdi:transmission-tower", lambda c: c.controller.config.target_grid_w,
+                  purpose=(
+                      "The grid power the zero-grid loop aims for, as measured by the Shelly. "
+                      "Slightly negative (export) so the house never imports. The billing meter "
+                      "(Tibber Pulse) reads ~14 W more import than the Shelly around zero "
+                      "(2026-09-27), so -60 W is ~-46 W of real export. Everything below zero "
+                      "while the batteries cover the house is battery energy sold at the "
+                      "feed-in price, and the planner counts it as drain (with overshoot "
+                      "~85 W at -60 W).")),
     ManagerNumber(CONF_KP, "Proportional Gain (Kp)", 0.0, 3.0, 0.05, None,
                   "mdi:tune", lambda c: c.controller.config.kp),
     ManagerNumber(CONF_KD, "Derivative Gain (Kd)", 0.0, 2.0, 0.05, None,
@@ -119,11 +127,24 @@ NUMBERS: tuple[ManagerNumber, ...] = (
     ManagerNumber(CONF_MIN_SOC, "Minimum SOC", 5, 50, 1, "%",
                   "mdi:battery-low", lambda c: c.min_soc),
     ManagerNumber(CONF_MAX_BATTERY_SOC, "Maximum Charge SOC", 50, 100, 1, "%",
-                  "mdi:battery-high", lambda c: c.max_battery_soc),
+                  "mdi:battery-high", lambda c: c.max_battery_soc,
+                  purpose=(
+                      "Normal charge ceiling, kept to spare the cells the top band where "
+                      "calendar ageing is fastest. It is a SOFT cap: with Arbitrage on, the "
+                      "planner lifts it to the Adaptive Ceiling SOC when grid energy bought "
+                      "above it saves at least 5 ct over the coming day (e.g. the sun alone "
+                      "would fill to this cap before a cheap window ends, leaving no room for "
+                      "the night). Free PV alone never lifts it. A calibration or the adaptive "
+                      "gate can also open it.")),
     ManagerNumber(CONF_ADAPTIVE_CEILING_SOC, "Adaptive Ceiling SOC", 50, 100, 1, "%",
                   "mdi:battery-charging-100", lambda c: c.adaptive_ceiling_soc),
     ManagerNumber(CONF_ADAPTIVE_BASELINE_W, "Adaptive Baseline Load", 0, 3000, 50, "W",
-                  "mdi:home-lightning-bolt", lambda c: c.adaptive_baseline_w),
+                  "mdi:home-lightning-bolt", lambda c: c.adaptive_baseline_w,
+                  purpose=(
+                      "FALLBACK only. The house-load forecast is learned from the history DB "
+                      "per weekday and 15 minutes (re-fitted every 6 h). This value is used "
+                      "only before a week of history exists, and for hours the short-term "
+                      "learner has not seen yet.")),
     ManagerNumber(CONF_ADAPTIVE_FORECAST_DERATE, "Adaptive Forecast Derate", 0.5, 1.0, 0.05, None,
                   "mdi:cloud-percent", lambda c: c.adaptive_forecast_derate),
     # Read by the ARBITRAGE coordinator (it re-reads options every tick), but it

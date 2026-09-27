@@ -31,12 +31,15 @@ from .arbitrage import (
     fit_discharge_overhead_w,
     forecast_deficit_wh,
     plan_arbitrage,
+    plan_with_soft_cap,
     pv_slots_from_detailed,
     solcast_forecast_entities,
     with_discharge_overhead,
 )
 from .battery_bridge import BatteryBridge
+from .load_profile import LoadProfile, fit_load_profile
 from .const import (
+    CONF_ADAPTIVE_CEILING_SOC,
     CONF_ARBITRAGE_ENABLED,
     CONF_ARBITRAGE_PV_CONFIDENCE,
     CONF_BATTERY_CONFIG,
@@ -63,6 +66,9 @@ from .economics import (
 )
 from .settings import (
     ARBITRAGE_HORIZON_H,
+    DEFAULT_ADAPTIVE_CEILING_SOC,
+    SOFT_CAP_KEEP_GAIN_CT,
+    SOFT_CAP_LIFT_GAIN_CT,
     DEFAULT_ARBITRAGE_PV_CONFIDENCE,
     DEFAULT_BATTERY_COST_EUR,
     DEFAULT_FORECAST_MARGIN_PCT,
@@ -71,6 +77,7 @@ from .settings import (
     DELIVERY_HISTORY_DAYS,
     DELIVERY_MIN_POINTS,
     DELIVERY_VALID_RANGE,
+    LOAD_PROFILE_WINDOW_DAYS,
     OVERHEAD_VALID_RANGE_W,
     DEFAULT_EXPECTED_CYCLES,
     DEFAULT_MAX_BATTERY_SOC,
@@ -132,6 +139,10 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         # grid export (W) while the fleet covers the house (hel-139); None until measured
         self._overhead_w: float | None = None
         self._delivery_detail: dict[str, Any] = {}
+        # Max Charge SOC lifted by the planner because buying above it pays (hel-140)
+        self._ceiling_lifted = False
+        # house-load forecast from the history DB (hel-141); None until a week of data
+        self._load_profile: LoadProfile | None = None
 
     # ---- public surface (read by the manager, gated by the switch) ------
     @property
@@ -159,6 +170,23 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         not be needed later anyway. Unknown (no plan yet) counts as not in surplus.
         """
         return bool((self.data or {}).get("energy_surplus"))
+
+    @property
+    def ceiling_lift_soc(self) -> float | None:
+        """SOC the manager should allow charging to instead of the Max Charge SOC, or None.
+
+        Set when the planner found that grid purchases above the soft cap save
+        enough (arbitrage.plan_with_soft_cap, hel-140). Gated by the Arbitrage
+        switch like the rest of the actuation surface.
+        """
+        if not self.enabled or not self.data or not self.data.get("ceiling_lifted"):
+            return None
+        return self.data.get("ceiling_lift_soc")
+
+    @property
+    def load_profile(self) -> LoadProfile | None:
+        """The learned 15-minute load profile (also used by the adaptive PV gate)."""
+        return self._load_profile
 
     @property
     def hold_floor_soc(self) -> float | None:
@@ -248,6 +276,7 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("arbitrage: history refresh failed: %s", err)
             return
         await self._async_refresh_delivery(query, rows, now)
+        await self._async_refresh_load_profile(query, now)
         # log every BMS reset in the window (idempotent) so the drift model can be
         # checked against reality over time — best effort, never breaks the refresh
         recorder = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_history")
@@ -314,6 +343,22 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
             "delivery_window_days": DELIVERY_HISTORY_DAYS,
             "discharge_overhead_measured_w": round(overhead, 1) if overhead is not None else None,
         }
+
+    async def _async_refresh_load_profile(self, query, now: float) -> None:
+        """Re-fit the house-load forecast from the history DB (load_profile.py, hel-141).
+
+        Isolated like _async_refresh_delivery: a failure or thin data keeps the
+        previous profile (or, before the first one, the BaselineLearner fallback).
+        """
+        try:
+            rows = await query(int(now - LOAD_PROFILE_WINDOW_DAYS * 86400), int(now),
+                               table="bucket", limit=LOAD_PROFILE_WINDOW_DAYS * 96 + 96)
+            profile = fit_load_profile(rows, now, window_days=LOAD_PROFILE_WINDOW_DAYS)
+        except Exception as err:  # noqa: BLE001 - measurement must never break the tick
+            _LOGGER.warning("arbitrage: load profile refresh failed: %s", err)
+            return
+        if profile is not None:
+            self._load_profile = profile
 
     async def _async_calibration(self, bat: BatteryModel, buckets, eta: float,
                                  wear_ct: float = 0.0) -> dict[str, Any]:
@@ -452,15 +497,27 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
             CONF_ARBITRAGE_PV_CONFIDENCE, DEFAULT_ARBITRAGE_PV_CONFIDENCE)
         return pv_slots_from_detailed(periods, confidence)
 
-    def _load_by_hour(self) -> list[float] | None:
+    def _load_at(self) -> tuple[Any, str]:
+        """(Wh-for-the-bucket-at-ts function, source) for build_buckets, or (None, "none").
+
+        The history-DB profile when there is one (hel-141). Before a week of
+        history exists, the manager's BaselineLearner (per weekday and hour, with
+        the configured Adaptive Baseline Load for unlearned slots). Either way each
+        bucket is looked up with ITS OWN weekday: the old per-hour list used
+        today's weekday for the whole 36 h horizon.
+        """
+        if self._load_profile is not None:
+            return self._load_profile.at, "profile"
         mgr = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id)
         learner = getattr(mgr, "_learner", None)
         baseline = getattr(mgr, "adaptive_baseline_w", 500.0)
         if learner is None:
-            return None
-        # W per hour -> Wh per 15-min bucket
-        return [learner.baseline_for_slot(datetime.now().weekday(), h, baseline) * 0.25
-                for h in range(24)]
+            return None, "none"
+
+        def learned(ts: float) -> float:
+            d = datetime.fromtimestamp(ts)
+            return learner.baseline_for_slot(d.weekday(), d.hour, baseline) * 0.25  # W -> Wh/15 min
+        return learned, "learner"
 
     # ---- the (advisory) tick -------------------------------------------
     async def _async_update_data(self) -> dict[str, Any]:
@@ -485,13 +542,23 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
             )
             prices = await self._prices()
             pv = self._pv_by_slot()
+            load_at, load_src = self._load_at()
             buckets = build_buckets(
-                time.time(), prices, pv, self._load_by_hour(),
-                horizon_h=ARBITRAGE_HORIZON_H,
+                time.time(), prices, pv, None,
+                horizon_h=ARBITRAGE_HORIZON_H, load_at=load_at,
             )
             overhead_w, overhead_src = self._overhead()
             buckets = with_discharge_overhead(buckets, overhead_w)
-            plan = plan_arbitrage(buckets, bat, econ)
+            # Max Charge SOC is a soft cap: plan at it, and lift it to the adaptive
+            # ceiling only when buying above it pays (hel-140). Not while a
+            # calibration has already opened the ceiling (bat.max_soc is 100 then).
+            hard_max = float(self.entry.options.get(CONF_ADAPTIVE_CEILING_SOC,
+                                                    DEFAULT_ADAPTIVE_CEILING_SOC))
+            plan, self._ceiling_lifted, lift_gain = plan_with_soft_cap(
+                buckets, bat, econ, hard_max_soc=hard_max,
+                lift_gain_ct=SOFT_CAP_LIFT_GAIN_CT, keep_gain_ct=SOFT_CAP_KEEP_GAIN_CT,
+                lifted_before=self._ceiling_lifted,
+            )
             deficit = forecast_deficit_wh(buckets, bat)
             try:
                 calib = await self._async_calibration(bat, buckets, eta, wear)
@@ -518,6 +585,10 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
                 "eta_override": self.eta_override, **self._eta_detail,
                 "delivery_factor": delivery, "delivery_source": delivery_src,
                 "discharge_overhead_w": overhead_w, "discharge_overhead_source": overhead_src,
+                "load_source": load_src,
+                "load_profile_days": self._load_profile.days if self._load_profile else 0,
+                "ceiling_lifted": self._ceiling_lifted, "ceiling_lift_soc": hard_max,
+                "ceiling_lift_gain_ct": round(lift_gain, 1),
                 **self._delivery_detail,
                 "horizon_buckets": len(buckets),
                 # last PV slot the forecast covers — if the priced horizon runs past

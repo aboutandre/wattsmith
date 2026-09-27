@@ -148,6 +148,14 @@ CALIBRATION_LOOKAHEAD_BUCKETS: Final[int] = 96   # cheapest window searched with
 # more than this much cheaper (and only if nothing dearer comes in between):
 # see soc_drift.plan_calibration, hel-139.
 CALIBRATION_COMMIT_MARGIN_CT: Final[float] = 3.0
+# Max Charge SOC as a SOFT cap (hel-140, arbitrage.plan_with_soft_cap): the planner
+# may lift the ceiling to the adaptive ceiling (100%) when grid purchases above the
+# cap save at least LIFT ct over the horizon; once lifted it stays lifted while the
+# extra saving is at least KEEP ct, so it does not flap on each re-plan.
+# House-load forecast (hel-141, load_profile.py): history the profile is fitted on.
+LOAD_PROFILE_WINDOW_DAYS: Final[int] = 56
+SOFT_CAP_LIFT_GAIN_CT: Final[float] = 5.0
+SOFT_CAP_KEEP_GAIN_CT: Final[float] = 1.0
 DEFAULT_MIN_ARBITRAGE_MARGIN_CT: Final[float] = 1.5   # skip sub-margin churn
 # Plan against the mean of Solcast's central and p10 estimates: missing a deficit
 # costs a peak-price import, overshooting costs only the spread plus wear.

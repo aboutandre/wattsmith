@@ -29,7 +29,8 @@ Rolling: recomputed every tick; only the current-window action is acted on.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from .economics import effective_cost_ct, is_profitable
@@ -89,6 +90,7 @@ def build_buckets(
     pv_by_slot: dict[int, float],
     load_by_hour: list[float] | None,
     horizon_h: float = 36.0,
+    load_at: Callable[[float], float] | None = None,
 ) -> list[Bucket]:
     """Align confirmed prices + PV forecast + load into 15-min Bucket list.
 
@@ -96,6 +98,9 @@ def build_buckets(
       - prices: [(start_epoch, EUR/kWh), ...] at whatever cadence the tariff
         publishes (hourly or 15-min); the covering price is carried forward.
       - pv_by_slot: {bucket_start_epoch: forecast_Wh} (from Solcast detail).
+      - load_at: Wh for the bucket starting at a timestamp (the history-DB load
+        profile, hel-141). Takes precedence over load_by_hour. Each bucket is
+        asked with its own timestamp, so tomorrow gets tomorrow's weekday.
       - load_by_hour: 24-length Wh/bucket by hour-of-day (learned baseline / 4),
         or None to assume a flat 0 (deficit only from explicit load).
     Only buckets with a confirmed price are emitted (no price forecasting).
@@ -112,7 +117,9 @@ def build_buckets(
         if price is None:
             break  # beyond the confirmed horizon
         pv = pv_by_slot.get(ts, 0.0)
-        if load_by_hour:
+        if load_at is not None:
+            load = load_at(ts)
+        elif load_by_hour:
             load = load_by_hour[local_hour(ts) % 24]
         else:
             load = 0.0
@@ -296,6 +303,10 @@ class ArbitragePlan:
     next_need_price_ct: float | None = None
     buy_idx: int | None = None
     buy_price_ct: float | None = None
+    # What the planned purchases save against buying at the moment of need, over
+    # the horizon: sum of wh * (need price - effective buy cost) / 1000, in ct.
+    # Lets two plans for the same forecast be compared (see plan_with_soft_cap).
+    saving_ct: float = 0.0
 
 
 def _idle(bat: BatteryModel, reason: str) -> ArbitragePlan:
@@ -516,6 +527,8 @@ def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> Arbi
             remaining -= take
             matched.append((i, p_need, j, p_buy, take))
 
+    saving_ct = sum(wh * (p_need - effective_cost_ct(p_buy, econ.eta, econ.wear_ct)) / 1000.0
+                    for _i, p_need, _j, p_buy, wh in matched)
     first_need = min((i for i, _p, _j, _pb, _w in matched), default=None)
     need_price = next((p for i, p, _j, _pb, _w in matched if i == first_need), None)
 
@@ -536,7 +549,7 @@ def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> Arbi
 
     grid_now = min(purchases[0], headroom_now)
     target_soc = bat.soc_pct + grid_now / bat.wh_per_pct
-    common = dict(next_need_idx=first_need, next_need_price_ct=need_price)
+    common = dict(next_need_idx=first_need, next_need_price_ct=need_price, saving_ct=saving_ct)
     if grid_now < 1.0:
         buy_j = min((j for _i, _p, j, _pb, _w in matched), default=None)
         return ArbitragePlan(
@@ -553,3 +566,40 @@ def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> Arbi
         f"for {profitable_wh:.0f} Wh needed from bucket {first_need} @ {need_price:.1f} ct",
         buy_idx=0, buy_price_ct=charge_price, **common,
     )
+
+
+def plan_with_soft_cap(
+    buckets: list[Bucket], bat: BatteryModel, econ: Econ, hard_max_soc: float,
+    lift_gain_ct: float, keep_gain_ct: float, lifted_before: bool,
+) -> tuple[ArbitragePlan, bool, float]:
+    """Plan under the Max Charge SOC as a SOFT cap that may be lifted to `hard_max_soc`.
+
+    Returns (plan, lifted, gain_ct).
+
+    Why (hel-140): the Max Charge SOC (80% here) keeps the cells out of the top
+    band, where calendar ageing is fastest, most of the time. Holding it as a hard
+    limit can stop the one purchase that matters, though. On an afternoon like
+    2026-09-26, the sun alone fills the fleet to 80% before the cheap window
+    ends. There is then no room left to carry 14 ct energy into a 33-42 ct night,
+    and the planner reports "no profitable window" even though the night is short.
+
+    So the cap holds unless lifting it pays: the plan is made twice, at
+    bat.max_soc (the soft cap) and at hard_max_soc, and the higher ceiling is used
+    only when its purchases save at least `lift_gain_ct` more (saving_ct: sum of
+    wh * (need price - effective buy cost)). Once lifted, it stays lifted while the
+    extra saving is still at least `keep_gain_ct` (hysteresis), so the ceiling does
+    not flap on each 5-minute re-plan as the forecast wobbles.
+
+    Only purchases count as the gain. A higher ceiling also lets the sun fill
+    further, but free PV alone is never a reason to sit above the cap. Calendar
+    ageing is about TIME spent high, and a lift driven by a purchase is spent the
+    same night.
+    """
+    soft = plan_arbitrage(buckets, bat, econ)
+    if hard_max_soc <= bat.max_soc:
+        return soft, False, 0.0
+    hard = plan_arbitrage(buckets, replace(bat, max_soc=hard_max_soc), econ)
+    gain = hard.saving_ct - soft.saving_ct
+    if gain >= (keep_gain_ct if lifted_before else lift_gain_ct):
+        return hard, True, gain
+    return soft, False, gain

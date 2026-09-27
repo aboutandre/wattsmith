@@ -413,3 +413,34 @@ if __name__ == "__main__":
         t()
         print(f"  PASS {t.__name__}")
     print(f"\n{len(tests)} arbitrage tests passed ✓")
+
+
+def test_free_pv_alone_never_lifts_the_soft_cap():
+    # a sunny day that would fill well past 80%, no purchase need at all: the cap
+    # holds (calendar ageing is about time spent high; free PV is no reason)
+    fleet = BatteryModel(soc_pct=70.0, capacity_wh=15360.0, min_soc=11.0,
+                         max_soc=80.0, charge_power_w=7500.0)
+    buckets = [Bucket(25, 1500, 200)] * 16 + [Bucket(30, 0, 150)] * 16
+    _plan, lifted, gain = a.plan_with_soft_cap(buckets, fleet, ECON, 100.0, 5.0, 1.0, False)
+    assert not lifted and gain < 5.0
+
+
+def test_soft_cap_not_consulted_when_the_ceiling_is_already_open():
+    fleet = BatteryModel(soc_pct=70.0, capacity_wh=15360.0, min_soc=11.0,
+                         max_soc=100.0, charge_power_w=7500.0)     # calibration open
+    _plan, lifted, gain = a.plan_with_soft_cap([Bucket(10, 0, 500)] * 8, fleet, ECON,
+                                               100.0, 5.0, 1.0, False)
+    assert not lifted and gain == 0.0
+
+
+def test_build_buckets_asks_the_load_profile_per_bucket():
+    # the history-DB profile (hel-141) is looked up with each bucket's own
+    # timestamp, so the horizon's second day gets its own weekday's load
+    seen = []
+
+    def load_at(ts):
+        seen.append(ts)
+        return 111.0
+    buckets = a.build_buckets(0.0, [(0.0, 0.30)], {}, [999.0] * 24, horizon_h=1.0, load_at=load_at)
+    assert [b.load_wh for b in buckets] == [111.0] * 4        # takes precedence over the list
+    assert seen == [0.0, 900.0, 1800.0, 2700.0]

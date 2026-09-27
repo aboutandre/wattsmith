@@ -131,6 +131,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         # Latest adaptive decision (published for the Adaptive entities).
         self._adaptive: AdaptiveResult | None = None
         self._battery_capacity_wh: dict[str, float] = {}
+        self._ceiling_lift: float | None = None
         # True while a calibration full charge is lifting the ceiling (published on status).
         self._calibrating = False
         # Pulse hold state (published on status).
@@ -265,6 +266,12 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         arb = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_arb")
         return bool(getattr(arb, "energy_surplus", False))
 
+    def _arb_ceiling_lift_soc(self) -> float | None:
+        """Charge ceiling the arbitrage planner asks for above the soft cap, or None (hel-140)."""
+        arb = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_arb")
+        lift = getattr(arb, "ceiling_lift_soc", None)
+        return float(lift) if isinstance(lift, (int, float)) else None
+
     def _arb_calibration_open_ceiling(self) -> bool:
         """True while the arbitrage coordinator says a calibration charge is due."""
         arb = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_arb")
@@ -389,6 +396,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             remaining_pv_wh=self._read_remaining_pv_wh(),
             hours_to_sunset=self._hours_to_sunset(),
             was_open=bool(self._adaptive and self._adaptive.open),
+            load_until_sunset_wh=self._load_until_sunset_wh(),
         )
         return plan_adaptive_ceiling(obs, AdaptiveConfig(
             enabled=self.adaptive_enabled,
@@ -397,6 +405,20 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             forecast_derate=self.adaptive_forecast_derate,
             hysteresis_wh=ADAPTIVE_HYSTERESIS_WH,
         ))
+
+    def _load_until_sunset_wh(self) -> float | None:
+        """Expected house energy until sunset from the history-DB load profile (hel-141).
+
+        None without a profile yet: the adaptive gate then falls back to the learned
+        baseline for the CURRENT hour times the hours left, the old estimate.
+        """
+        arb = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_arb")
+        profile = getattr(arb, "load_profile", None)
+        hours = self._hours_to_sunset()
+        if profile is None or hours <= 0:
+            return None
+        now = dt_util.utcnow().timestamp()
+        return profile.energy_between(now, now + hours * 3600.0)
 
     def _read_remaining_pv_wh(self) -> float | None:
         """Solcast remaining-today forecast in Wh (the sensor reports kWh)."""
@@ -585,6 +607,14 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             self._calibrating = self._arb_calibration_open_ceiling()
             if self._calibrating:
                 self.planner.config.max_battery_soc = 100.0
+            # Max Charge SOC is a soft cap (hel-140): the arbitrage planner lifts it
+            # when buying above it pays (e.g. PV alone would fill to 80% before the
+            # cheap window ends and leave no room for the night's energy). The EV
+            # right-of-way below still applies.
+            self._ceiling_lift = self._arb_ceiling_lift_soc()
+            if self._ceiling_lift is not None:
+                self.planner.config.max_battery_soc = max(
+                    self.planner.config.max_battery_soc, self._ceiling_lift)
             # EV solar-charging right-of-way: hold batteries at reserve SOC so
             # they don't compete with the car for the same PV watts.
             ev_reserve = self._ev_solar_reserve_soc()
@@ -662,6 +692,7 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
             "excluded_batteries": plan.excluded,
             "arb_charging": self._arb_charging,
             "calibrating": self._calibrating,
+            "ceiling_lift_soc": self._ceiling_lift,
             "pulse_hold": {
                 "enabled": self._pulse_hold_enabled,
                 "energy_surplus": self._energy_surplus,

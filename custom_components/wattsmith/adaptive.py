@@ -63,6 +63,10 @@ class AdaptiveObservation:
     remaining_pv_wh: float | None    # Solcast remaining-today forecast (Wh)
     hours_to_sunset: float           # remaining PV window (h)
     was_open: bool = False           # was the ceiling open on the previous tick?
+    # Expected house energy from now until sunset (Wh), from the history-DB load
+    # profile (hel-141). None -> fall back to baseline_load_w * hours_to_sunset,
+    # which applies ONE hour's load to the whole afternoon.
+    load_until_sunset_wh: float | None = None
 
 
 @dataclass(frozen=True)
@@ -111,11 +115,9 @@ def plan_adaptive_ceiling(
     fleet_headroom_wh = max(
         0.0, obs.fleet_capacity_wh * (cfg.ceiling_soc - obs.fleet_soc) / 100.0
     )
-    remaining_surplus_wh = max(
-        0.0,
-        obs.remaining_pv_wh * cfg.forecast_derate
-        - cfg.baseline_load_w * obs.hours_to_sunset,
-    )
+    load_wh = (obs.load_until_sunset_wh if obs.load_until_sunset_wh is not None
+               else cfg.baseline_load_w * obs.hours_to_sunset)
+    remaining_surplus_wh = max(0.0, obs.remaining_pv_wh * cfg.forecast_derate - load_wh)
 
     # Latch: once the pack has climbed past the cap we keep the ceiling open for
     # the rest of the window so a forecast wobble can't slam it shut mid-climb.

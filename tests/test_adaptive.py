@@ -5,6 +5,8 @@ Or with pytest: pytest tests/test_adaptive.py
 """
 import importlib.util
 import sys
+
+import pytest
 from pathlib import Path
 
 _path = Path(__file__).resolve().parents[1] / "custom_components" / "wattsmith" / "adaptive.py"
@@ -183,6 +185,15 @@ def test_noon_forecast_wobble_no_longer_toggles_the_ceiling():
 
     assert flips(0.0) >= 5            # without hysteresis: toggles on every wobble
     assert flips(1000.0) == 1         # with it: opens once and stays open
+
+
+def test_load_until_sunset_replaces_one_hour_times_the_afternoon():
+    # the old estimate: baseline_load_w (the CURRENT hour's value) x hours to sunset
+    old = plan(_obs(remaining_pv_wh=6000.0, hours_to_sunset=4.0), _cfg(baseline_load_w=800.0))
+    new = plan(_obs(remaining_pv_wh=6000.0, hours_to_sunset=4.0, load_until_sunset_wh=1200.0),
+               _cfg(baseline_load_w=800.0))
+    assert old.remaining_surplus_wh == pytest.approx(6000.0 - 3200.0)
+    assert new.remaining_surplus_wh == pytest.approx(6000.0 - 1200.0)
 
 
 if __name__ == "__main__":

@@ -206,6 +206,40 @@ def test_replay_seed_values_already_prevent_it():
     assert empty_at is None and dear_kwh == 0.0
 
 
+# ── 4b. the 80% cap as a SOFT cap (hel-140) ───────────────────────────────────
+# With the calibration NOT open, the ceiling is the 80% Max Charge SOC. On this
+# afternoon the sun alone fills the fleet to 80% before the cheap window ends, so
+# even the corrected planner found "no profitable window": no room to carry 14 ct
+# energy into the night. plan_with_soft_cap lifts the cap only when that pays.
+def _soft(lifted_before=False, lift=5.0, keep=1.0):
+    from dataclasses import replace
+    bat = replace(_fleet(R["soc_at_1312"], TRUE_DELIVERY), max_soc=80.0)
+    return a.plan_with_soft_cap(_buckets(overhead_w=TRUE_EXPORT_W), bat, ECON,
+                                hard_max_soc=100.0, lift_gain_ct=lift, keep_gain_ct=keep,
+                                lifted_before=lifted_before)
+
+
+def test_at_80_percent_the_night_cannot_be_bought_for():
+    from dataclasses import replace
+    bat = replace(_fleet(R["soc_at_1312"], TRUE_DELIVERY), max_soc=80.0)
+    plan = a.plan_arbitrage(_buckets(overhead_w=TRUE_EXPORT_W), bat, ECON)
+    assert plan.saving_ct == 0.0 and "no profitable window" in plan.reason
+
+
+def test_soft_cap_lifts_to_carry_14_ct_energy_into_the_night():
+    plan, lifted, gain = _soft()
+    assert lifted and gain >= 5.0, (gain, plan.reason)
+    assert plan.buy_idx == 1 and plan.buy_price_ct < 15.0, plan.reason
+
+
+def test_soft_cap_hysteresis():
+    _plan, _lifted, gain = _soft()
+    # a gain between the two thresholds keeps an existing lift but does not start one
+    _p, lifted_new, _g = _soft(lifted_before=False, lift=gain + 1.0, keep=gain - 1.0)
+    _p, lifted_kept, _g = _soft(lifted_before=True, lift=gain + 1.0, keep=gain - 1.0)
+    assert not lifted_new and lifted_kept
+
+
 # ── 5. the calibration top-up that gave up ────────────────────────────────────
 def _calibration(prices, in_progress):
     drift = {"a": tsd._drift(17.4, 4.6)}                  # overdue, as that afternoon
