@@ -224,6 +224,12 @@ class ArbitrageSensor(CoordinatorEntity, SensorEntity):
         return {
             "enabled": data.get("enabled"),
             "eta_source": data.get("eta_source"),
+            # socket Wh per displayed-SOC Wh the planner counts with (hel-139)
+            "delivery_factor": data.get("delivery_factor"),
+            "delivery_source": data.get("delivery_source"),        # measured | seed
+            # grid export (W) counted as battery drain while it covers the house (hel-139)
+            "discharge_overhead_w": data.get("discharge_overhead_w"),
+            "discharge_overhead_source": data.get("discharge_overhead_source"),
             "target_soc": data.get("target_soc"),
             "horizon_buckets": data.get("horizon_buckets"),
             "pv_forecast_until": data.get("pv_forecast_until"),

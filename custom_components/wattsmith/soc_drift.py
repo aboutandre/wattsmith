@@ -206,6 +206,96 @@ def fit_eta_standby(windows: list[Window], min_windows: int = 6) -> EtaFit | Non
 
 
 @dataclass(frozen=True)
+class DeliveryFit:
+    factor: float                    # socket Wh delivered per nominal Wh of displayed SOC
+    points: float                    # displayed-SOC points of discharge it rests on
+    per_battery: dict[str, float]    # the same ratio per battery (diagnostics)
+
+
+def fit_delivery_factor(
+    rows: list[dict],
+    capacity_wh: dict[str, float],
+    min_points: float = 100.0,
+    min_run_pts: float = 3.0,
+) -> DeliveryFit | None:
+    """How much energy a displayed SOC point really delivers (hel-139).
+
+        factor = sum(discharge_wh) / sum(displayed SOC drop / 100 * capacity_wh)
+
+    over runs of consecutive discharge-only buckets. The planner multiplies the
+    rated capacity by this factor, so it counts stored energy in the same unit as
+    the loads it has to cover: Wh at the socket.
+
+    Why not just use the rated capacity: over a discharge, the displayed SOC falls
+    faster than the socket energy would suggest, for two stacking reasons. The
+    inverter and standby lose part of every discharged kWh, and the BMS count
+    drifts low between full charges (see the module docstring). On this fleet the
+    ratio is 0.82-0.84 (2026-09-27, 3/7/14-day windows, all three batteries alike):
+    every displayed % is worth ~127 Wh, not the nominal 154 Wh.
+
+    Why runs and not single buckets: SOC is logged in whole percent, so one
+    bucket's drop is 0 or 1 point regardless of the energy in it. Over a run of
+    consecutive buckets the drops telescope (start of the first minus end of the
+    last) and the rounding cancels, leaving at most one point of error per run.
+    A run ends at a gap, at any charging (charge_wh >= 5 Wh), at a missing
+    reading, or when SOC moves up. An upward move while discharging is a BMS reset
+    (hel-134): the jump is a correction, not energy, so it must not be counted.
+    Runs shorter than `min_run_pts` are dropped because their +-1 point of
+    rounding would dominate. With fewer than `min_points` in total (about one
+    night of discharge) there is not enough to go on, so the result is None and
+    the caller keeps its fallback.
+
+    This is deliberately NOT the round-trip eta (fit_eta_standby): eta prices a
+    purchase (AC in -> AC out between two exact 100% points), while this factor
+    converts what the display shows now into what it will deliver. The two answer
+    different questions and are measured on different windows.
+    """
+    by_battery: dict[str, list[dict]] = {}
+    for r in rows:
+        by_battery.setdefault(r["battery_id"], []).append(r)
+    total_wh = total_nominal = total_pts = 0.0
+    per_battery: dict[str, float] = {}
+    for bid, rs in by_battery.items():
+        cap = capacity_wh.get(bid)
+        if not cap or cap <= 0:
+            continue
+        wh = pts = 0.0
+        for run in _discharge_runs(sorted(rs, key=lambda r: r["ts_start"])):
+            drop = run[0]["soc_start"] - run[-1]["soc_end"]
+            if drop < min_run_pts:
+                continue
+            wh += sum(r["discharge_wh"] for r in run)
+            pts += drop
+        if pts > 0:
+            per_battery[bid] = wh / (pts / 100.0 * cap)
+            total_wh += wh
+            total_nominal += pts / 100.0 * cap
+            total_pts += pts
+    if total_pts < min_points or total_nominal <= 0:
+        return None
+    return DeliveryFit(factor=total_wh / total_nominal, points=total_pts, per_battery=per_battery)
+
+
+def _discharge_runs(rows: list[dict]):
+    """Maximal runs of consecutive, gap-free, discharge-only buckets whose SOC only
+    moves down, each bucket continuing exactly where the previous one ended."""
+    run: list[dict] = []
+    for r in rows:
+        ok = (r.get("soc_start") is not None and r.get("soc_end") is not None
+              and (r.get("charge_wh") or 0.0) < 5.0 and (r.get("discharge_wh") or 0.0) > 0.0
+              and r["soc_end"] <= r["soc_start"])
+        if (ok and run and r["ts_start"] - run[-1]["ts_start"] == BUCKET_S
+                and r["soc_start"] == run[-1]["soc_end"]):
+            run.append(r)
+            continue
+        if run:
+            yield run
+        run = [r] if ok else []
+    if run:
+        yield run
+
+
+@dataclass(frozen=True)
 class BatteryDrift:
     battery_id: str
     last_full_ts: float | None    # None: not full anywhere in the rows given
@@ -272,6 +362,10 @@ def plan_calibration(
     need_wh: float,
     per_bucket_wh: float,
     lookahead: int = 96,
+    in_progress: bool = False,
+    commit_margin_ct: float = 3.0,
+    eta: float = 1.0,
+    wear_ct: float = 0.0,
 ) -> CalibrationPlan:
     """Decide whether the fleet needs a full charge, and whether from PV or grid.
 
@@ -280,6 +374,26 @@ def plan_calibration(
     Due opens the charge ceiling so PV can finish the job. If PV has not managed
     it by `threshold_pts + grid_extra_pts` (or `max_days` is exceeded), the fleet
     tops up from the grid in the cheapest buckets of the next `lookahead`.
+
+    Finishing a top-up that is already running (`in_progress`, hel-139):
+    the cheapest-buckets search looks 24 h ahead, and that horizon jumps when
+    Tibber publishes tomorrow's prices (~13:00). On 2026-09-26 a top-up was
+    buying at 14.3 ct when tomorrow's noon appeared at 13.4-13.8 ct. The search
+    moved to tomorrow and stopped halfway, at 61%. That evening and night cost
+    33-42 ct, the fleet ran empty at 06:00, and ~2 kWh were bought at 33 ct to save
+    <1 ct/kWh on the top-up. Moving a purchase past an expensive stretch trades
+    cheap energy for tonight against a slightly cheaper top-up tomorrow.
+
+    So once charging has started it continues, unless BOTH:
+      - a later window is cheaper than now by more than `commit_margin_ct`, and
+      - nothing between now and that window costs as much as energy bought now
+        delivers at (price_now / eta + wear_ct, the planner's own buy test, cf.
+        economics.effective_cost_ct). If something does, what we buy now will be
+        used in between at a profit, whatever the calibration does later.
+    The first tick of a top-up is unchanged: it starts in the cheapest window as
+    before. The rule only stops a started top-up from being abandoned for a
+    marginal saving. With the defaults (eta 1, wear 0, in_progress False) the
+    behaviour is exactly the old one.
     """
     if not enabled:
         return CalibrationPlan("off", False, False, (), "calibration disabled")
@@ -318,5 +432,19 @@ def plan_calibration(
                                f"overdue — topping up from the grid @ {window[0]:.1f} ct "
                                f"(cheapest {n} buckets)")
     first = min(chosen)
+    if in_progress:
+        now_ct = window[0]
+        later_ct = min(window[i] for i in chosen)
+        delivered_ct = now_ct / eta + wear_ct if eta > 0 else float("inf")
+        dearest_between = max(window[1:first], default=0.0)
+        if now_ct - later_ct <= commit_margin_ct:
+            return CalibrationPlan("grid_charging", True, True, ids,
+                                   f"overdue — finishing the top-up @ {now_ct:.1f} ct "
+                                   f"(bucket {first} is only {now_ct - later_ct:.1f} ct cheaper)")
+        if dearest_between >= delivered_ct:
+            return CalibrationPlan("grid_charging", True, True, ids,
+                                   f"overdue — finishing the top-up @ {now_ct:.1f} ct "
+                                   f"(it pays before bucket {first}: up to {dearest_between:.1f} ct "
+                                   f"vs {delivered_ct:.1f} ct delivered)")
     return CalibrationPlan("grid_waiting", True, False, ids,
                            f"overdue — grid top-up waits for bucket {first} @ {window[first]:.1f} ct")

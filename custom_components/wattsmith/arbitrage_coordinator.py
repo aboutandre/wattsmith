@@ -14,6 +14,7 @@ inert plan (no charge, no hold) so a forecast hiccup can't affect dispatch.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -27,10 +28,12 @@ from .arbitrage import (
     BatteryModel,
     Econ,
     build_buckets,
+    fit_discharge_overhead_w,
     forecast_deficit_wh,
     plan_arbitrage,
     pv_slots_from_detailed,
     solcast_forecast_entities,
+    with_discharge_overhead,
 )
 from .battery_bridge import BatteryBridge
 from .const import (
@@ -48,6 +51,7 @@ from .const import (
     CONF_MIN_ARBITRAGE_MARGIN_CT,
     CONF_MIN_SOC,
     CONF_SOLCAST_FORECAST_SENSOR,
+    CONF_TARGET_GRID_W,
     CONF_TIBBER_SENSOR,
     CONF_WEAR_COST_CT,
     DOMAIN,
@@ -63,12 +67,18 @@ from .settings import (
     DEFAULT_BATTERY_COST_EUR,
     DEFAULT_FORECAST_MARGIN_PCT,
     DEFAULT_ETA_SEED,
+    DEFAULT_TARGET_GRID_W,
+    DELIVERY_HISTORY_DAYS,
+    DELIVERY_MIN_POINTS,
+    DELIVERY_VALID_RANGE,
+    OVERHEAD_VALID_RANGE_W,
     DEFAULT_EXPECTED_CYCLES,
     DEFAULT_MAX_BATTERY_SOC,
     DEFAULT_MAX_BATTERY_POWER,
     DEFAULT_MIN_ARBITRAGE_MARGIN_CT,
     DEFAULT_MIN_SOC,
     CALIBRATION_GRID_EXTRA_PTS,
+    CALIBRATION_COMMIT_MARGIN_CT,
     CALIBRATION_LOOKAHEAD_BUCKETS,
     DEFAULT_CALIBRATION_ENABLED,
     DEFAULT_CALIBRATION_GRID,
@@ -86,6 +96,7 @@ from .soc_drift import (
     CalibrationPlan,
     DriftFit,
     battery_drift_now,
+    fit_delivery_factor,
     fit_drift_rate,
     fit_eta_standby,
     full_to_full_windows,
@@ -116,6 +127,11 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         self._drift_fits: dict[str, DriftFit] = {}
         self._fleet_drift: DriftFit | None = None
         self._calibration: CalibrationPlan | None = None
+        # socket Wh per displayed-SOC Wh (hel-139); None until the history has enough
+        self._delivery_factor: float | None = None
+        # grid export (W) while the fleet covers the house (hel-139); None until measured
+        self._overhead_w: float | None = None
+        self._delivery_detail: dict[str, Any] = {}
 
     # ---- public surface (read by the manager, gated by the switch) ------
     @property
@@ -168,6 +184,34 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
             return self._measured_eta, "measured"
         return DEFAULT_ETA_SEED, "seed"
 
+    def _delivery(self, eta: float) -> tuple[float, str]:
+        """How much socket energy one displayed SOC Wh delivers (BatteryModel.delivery_factor).
+
+        Measured from the last DELIVERY_HISTORY_DAYS of discharge when there is
+        enough of it. Until then (fresh install, DB just created) the seed is the
+        discharge leg of the round trip, sqrt(eta): with the measured eta 0.817
+        that is 0.90. That is still above the 0.82-0.84 this fleet really delivers
+        (the seed knows nothing about the BMS drift), but it is much closer than 1.0,
+        the value that overstated the stored energy by ~20% (hel-139). The
+        measurement replaces it after about one night of discharge.
+        """
+        if self._delivery_factor is not None:
+            return self._delivery_factor, "measured"
+        return math.sqrt(eta), "seed"
+
+    def _overhead(self) -> tuple[float, str]:
+        """Battery energy that goes to the grid while discharging, W (see with_discharge_overhead).
+
+        Measured from the history DB when there is a day of discharge to go on.
+        Until then the seed is the configured grid target itself (e.g. -60 W ->
+        60 W): the controller aims for that export on purpose, so it is the floor
+        of the real figure (the overshoot on top was ~25 W here).
+        """
+        if self._overhead_w is not None:
+            return self._overhead_w, "measured"
+        target = float(self.entry.options.get(CONF_TARGET_GRID_W, DEFAULT_TARGET_GRID_W))
+        return max(0.0, -target), "seed"
+
     def _recorder_query(self):
         recorder = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_history")
         query = getattr(recorder, "async_query_range", None)
@@ -203,6 +247,7 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         except Exception as err:  # noqa: BLE001 - measurement must never break the tick
             _LOGGER.warning("arbitrage: history refresh failed: %s", err)
             return
+        await self._async_refresh_delivery(query, rows, now)
         # log every BMS reset in the window (idempotent) so the drift model can be
         # checked against reality over time — best effort, never breaks the refresh
         recorder = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id + "_history")
@@ -228,7 +273,50 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("arbitrage: measured η %.3f outside %s — keeping %s",
                             fit.eta, ETA_VALID_RANGE, self._measured_eta or DEFAULT_ETA_SEED)
 
-    async def _async_calibration(self, bat: BatteryModel, buckets, eta: float) -> dict[str, Any]:
+    async def _async_refresh_delivery(self, query, battery_rows: list[dict], now: float) -> None:
+        """Re-measure what stored energy is really worth at the socket (hel-139).
+
+        Two numbers, both from the last DELIVERY_HISTORY_DAYS of the history DB:
+          - the delivery factor (socket Wh per displayed-SOC Wh), from the
+            per-battery rows the eta/drift refresh already fetched;
+          - the discharge overhead (W exported while the fleet covers the house),
+            from the fleet `bucket` table.
+        Kept apart from the eta/drift fits so a failure here can never cost those
+        their refresh. On a failure, thin data or an implausible value the previous
+        figure stays (and, before the first good one, the seed).
+        """
+        try:
+            caps = {st.battery_id: st.capacity for st in self.bridge.read_all() if st.capacity}
+            # recent discharge only: the factor includes the BMS drift, which moves
+            # with the charge pattern and resets on every full charge
+            recent = [r for r in battery_rows if r["ts_start"] >= now - DELIVERY_HISTORY_DAYS * 86400]
+            delivery = fit_delivery_factor(recent, caps, min_points=DELIVERY_MIN_POINTS)
+            fleet_rows = await query(int(now - DELIVERY_HISTORY_DAYS * 86400), int(now),
+                                     table="bucket", limit=DELIVERY_HISTORY_DAYS * 96 + 96)
+            overhead = fit_discharge_overhead_w(fleet_rows)
+        except Exception as err:  # noqa: BLE001 - measurement must never break the tick
+            _LOGGER.warning("arbitrage: delivery/overhead refresh failed: %s", err)
+            return
+        d_lo, d_hi = DELIVERY_VALID_RANGE
+        d_valid = delivery is not None and d_lo <= delivery.factor <= d_hi
+        if d_valid:
+            self._delivery_factor = delivery.factor
+        elif delivery is not None:
+            _LOGGER.warning("arbitrage: measured delivery factor %.3f outside %s — keeping %s",
+                            delivery.factor, DELIVERY_VALID_RANGE, self._delivery_factor)
+        o_lo, o_hi = OVERHEAD_VALID_RANGE_W
+        if overhead is not None and o_lo <= overhead <= o_hi:
+            self._overhead_w = overhead
+        self._delivery_detail = {
+            "delivery_factor_measured": round(delivery.factor, 4) if delivery else None,
+            "delivery_factor_valid": d_valid,
+            "delivery_points": delivery.points if delivery else 0,
+            "delivery_window_days": DELIVERY_HISTORY_DAYS,
+            "discharge_overhead_measured_w": round(overhead, 1) if overhead is not None else None,
+        }
+
+    async def _async_calibration(self, bat: BatteryModel, buckets, eta: float,
+                                 wear_ct: float = 0.0) -> dict[str, Any]:
         """Predict each battery's SOC drift now and decide on a calibration charge."""
         opts = self.entry.options
         query = self._recorder_query()
@@ -251,6 +339,8 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         if cap_w > 0:
             per_bucket = min(per_bucket, cap_w * 0.25)
         need = bat.capacity_wh * max(0.0, 100.0 - bat.soc_pct) / 100.0 / max(eta, 0.5) ** 0.5
+        # was the previous tick already buying for the calibration? (finish it — hel-139)
+        in_progress = self._calibration is not None and self._calibration.grid_charge_now
         self._calibration = plan_calibration(
             drift, now,
             enabled=bool(opts.get(CONF_CALIBRATION_ENABLED, DEFAULT_CALIBRATION_ENABLED)),
@@ -261,6 +351,9 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
             prices_ct=[b.price_ct for b in buckets],
             need_wh=need, per_bucket_wh=per_bucket,
             lookahead=CALIBRATION_LOOKAHEAD_BUCKETS,
+            in_progress=in_progress,
+            commit_margin_ct=CALIBRATION_COMMIT_MARGIN_CT,
+            eta=eta, wear_ct=wear_ct,
         )
         per_battery = {}
         for bid, d in sorted(drift.items()):
@@ -379,6 +472,8 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
             if bat is None:
                 return self._inert("no batteries")
             eta, eta_src = self._eta()
+            delivery, delivery_src = self._delivery(eta)
+            bat = replace(bat, delivery_factor=delivery)
             wear = self._wear_ct()
             econ = Econ(
                 eta=eta, wear_ct=wear,
@@ -394,10 +489,12 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
                 time.time(), prices, pv, self._load_by_hour(),
                 horizon_h=ARBITRAGE_HORIZON_H,
             )
+            overhead_w, overhead_src = self._overhead()
+            buckets = with_discharge_overhead(buckets, overhead_w)
             plan = plan_arbitrage(buckets, bat, econ)
             deficit = forecast_deficit_wh(buckets, bat)
             try:
-                calib = await self._async_calibration(bat, buckets, eta)
+                calib = await self._async_calibration(bat, buckets, eta, wear)
             except Exception as err:  # noqa: BLE001 - calibration must never break arbitrage
                 _LOGGER.warning("arbitrage: calibration planning failed: %s", err)
                 self._calibration = None
@@ -419,6 +516,9 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
                 "reason": plan.reason,
                 "eta": eta, "eta_source": eta_src, "wear_ct": wear,
                 "eta_override": self.eta_override, **self._eta_detail,
+                "delivery_factor": delivery, "delivery_source": delivery_src,
+                "discharge_overhead_w": overhead_w, "discharge_overhead_source": overhead_src,
+                **self._delivery_detail,
                 "horizon_buckets": len(buckets),
                 # last PV slot the forecast covers — if the priced horizon runs past
                 # it, the planner is reading those hours as 0 W of sun

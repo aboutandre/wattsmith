@@ -16,7 +16,14 @@ Principles (docs/GRID_ARBITRAGE_AND_HISTORY_DB.md, Part A):
     (the discharge hold). What a stored kWh cost is sunk: keeping it is worth it
     whenever a later need is dearer than now, NOT only when buying for it would
     clear price/η + wear;
-  - bounded by max-SOC (charge) and min-SOC (discharge) and any import cap.
+  - bounded by max-SOC (charge) and min-SOC (discharge) and any import cap;
+  - energy is counted in Wh AT THE SOCKET, the unit the loads are measured in.
+    A displayed SOC % is worth capacity * delivery_factor / 100 (measured ~0.83,
+    not 1.0), and while the fleet covers the house it also feeds the grid a
+    little (the zero-grid target + overshoot, ~85 W), which is added to the load.
+    Counting nominal capacity and house load alone made the fleet look ~2 kWh
+    richer than it was and let it run empty before sunrise (hel-139,
+    BatteryModel.delivery_factor, with_discharge_overhead).
 
 Rolling: recomputed every tick; only the current-window action is acted on.
 """
@@ -114,6 +121,49 @@ def build_buckets(
     return buckets
 
 
+def with_discharge_overhead(buckets: list[Bucket], overhead_w: float) -> list[Bucket]:
+    """Add the energy the fleet sends to the GRID while it covers the house (hel-139).
+
+    The load forecast is house consumption. But while the batteries cover the
+    house, the zero-grid loop does not stop at 0 W at the meter. It aims slightly
+    below (number.wattsmith_target_grid_power, -60 W here) so the house never
+    imports, and it overshoots every time a load switches off, because the
+    batteries need ~7 s to follow. That energy leaves the battery and is sold at
+    the feed-in price. It is real battery drain that the house forecast does not
+    contain. Measured from the history DB on 2026-09-27: 84-87 W on average while
+    discharging (16-17% of all discharged energy), steady over 3/7/14 days. On the
+    night of 2026-09-26/27 that was 1.20 kWh, most of the ~2 kWh the planner was
+    short (together with BatteryModel.delivery_factor).
+
+    Added only to buckets where the fleet is expected to cover the house (load >
+    PV). During a PV surplus the batteries charge and the export is PV, not
+    stored energy.
+    """
+    if overhead_w <= 0:
+        return buckets
+    extra = overhead_w * BUCKET_H
+    return [Bucket(b.price_ct, b.pv_wh, b.load_wh + extra) if b.load_wh > b.pv_wh else b
+            for b in buckets]
+
+
+def fit_discharge_overhead_w(rows: list[dict], min_buckets: int = 96) -> float | None:
+    """Mean grid export (W) while the fleet covers the house, from history-DB `bucket` rows.
+
+    Counts buckets where the fleet discharged (> 20 Wh), did not charge (< 5 Wh),
+    and PV was below the house load, so any export came from the batteries.
+    None below `min_buckets` (one day's worth of 15-min buckets): too little to
+    trust, and the caller keeps its seed (the configured grid target).
+    """
+    def g(r: dict, k: str) -> float:
+        return float(r.get(k) or 0.0)
+    sel = [r for r in rows
+           if g(r, "fleet_discharge_wh") > 20.0 and g(r, "fleet_charge_wh") < 5.0
+           and g(r, "pv_wh") < g(r, "house_wh")]
+    if len(sel) < min_buckets:
+        return None
+    return sum(g(r, "grid_export_wh") for r in sel) / (len(sel) * BUCKET_H)
+
+
 def pv_slots_from_detailed(
     periods: list[dict], confidence: str = "central"
 ) -> dict[int, float]:
@@ -194,6 +244,31 @@ class BatteryModel:
     min_soc: float
     max_soc: float
     charge_power_w: float
+    # Wh the fleet actually DELIVERS to the house per Wh of displayed SOC, i.e. per
+    # capacity_wh * (displayed % / 100). 1.0 treats every displayed % as its nominal
+    # share of the rated capacity.
+    #
+    # Why this exists (hel-139): the planner converts SOC into energy and compares it
+    # with house loads, which are measured at the socket (AC). The displayed % is
+    # not socket energy. The discharge leg loses energy (inverter, standby), and the
+    # BMS SOC reading drifts below reality between full charges (hel-134), so the
+    # displayed SOC falls faster than the energy delivered. Measured from the history
+    # DB on 2026-09-27: 0.82-0.84 over 3, 7 and 14 days, the same for all three
+    # batteries. Planning with 1.0 overstated the stored energy by ~20%. On
+    # 2026-09-26 at 13:12 that made "61% + the afternoon sun" look like enough for
+    # the night, so nothing was bought at 14 ct, and the fleet ran empty at 06:00
+    # with ~2 kWh still to cover at 33 ct.
+    #
+    # Everything the planner derives from SOC (usable energy, headroom, and the
+    # hold-floor / target SOCs it hands back) goes through `wh_per_pct`, so the
+    # planner works in socket Wh throughout. The coordinator measures the factor
+    # (soc_drift.fit_delivery_factor) and seeds it with sqrt(round-trip eta).
+    delivery_factor: float = 1.0
+
+    @property
+    def wh_per_pct(self) -> float:
+        """Socket Wh one displayed SOC percentage point is worth."""
+        return self.capacity_wh * self.delivery_factor / 100.0
 
 
 @dataclass(frozen=True)
@@ -339,11 +414,10 @@ def forecast_deficit_wh(buckets: list[Bucket], bat: BatteryModel) -> float | Non
     will not run short before it refills — its energy is in surplus. None when there
     is no forecast to judge by. Used to gate the zero-grid pulse hold (hel-136).
     """
-    if not buckets or bat.capacity_wh <= 0:
+    if not buckets or bat.wh_per_pct <= 0:
         return None
-    cap = bat.capacity_wh
-    usable_now = cap * max(0.0, bat.soc_pct - bat.min_soc) / 100.0
-    cap_usable = cap * max(0.0, bat.max_soc - bat.min_soc) / 100.0
+    usable_now = bat.wh_per_pct * max(0.0, bat.soc_pct - bat.min_soc)
+    cap_usable = bat.wh_per_pct * max(0.0, bat.max_soc - bat.min_soc)
     deficits, _trace = _forward_sim(
         buckets, usable_now, cap_usable,
         pv_charge_limit_wh=bat.charge_power_w * BUCKET_H,
@@ -359,9 +433,8 @@ def _hold_floor(buckets: list[Bucket], bat: BatteryModel, econ: Econ,
     this bucket (it is bought for later; serving now from it pays η + wear for
     nothing). Only the part of TODAY's stored energy those buckets depend on is
     kept: a dear evening that midday PV will cover needs none of it."""
-    cap = bat.capacity_wh
-    usable_now = cap * max(0.0, bat.soc_pct - bat.min_soc) / 100.0
-    cap_usable = cap * max(0.0, bat.max_soc - bat.min_soc) / 100.0
+    usable_now = bat.wh_per_pct * max(0.0, bat.soc_pct - bat.min_soc)
+    cap_usable = bat.wh_per_pct * max(0.0, bat.max_soc - bat.min_soc)
     charge_price = buckets[0].price_ct
     hold_bar = charge_price + econ.min_margin_ct
     dear = [a if (i >= 1 and worth[i] >= hold_bar) else 0.0 for i, a in enumerate(alloc)]
@@ -369,7 +442,7 @@ def _hold_floor(buckets: list[Bucket], bat: BatteryModel, econ: Econ,
                for b in buckets]
     spare = _removable(usable_now, surplus, dear, cap_usable, -1)
     hold_e = max(0.0, usable_now - spare) + bought_now
-    hold_floor_soc = bat.min_soc + 100.0 * hold_e / cap
+    hold_floor_soc = bat.min_soc + hold_e / bat.wh_per_pct
     # Below the wear cost, cycling a kWh through the cells costs more than simply
     # importing it — every Wh discharged now is a Wh of cell life spent to avoid a
     # cheaper grid purchase. Freeze discharge outright rather than merely earmark.
@@ -382,12 +455,11 @@ def _hold_floor(buckets: list[Bucket], bat: BatteryModel, econ: Econ,
 
 def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> ArbitragePlan:
     """Decide the current-window grid-charge + discharge-hold. buckets[0] = now."""
-    if not buckets or bat.capacity_wh <= 0:
+    if not buckets or bat.wh_per_pct <= 0:
         return _idle(bat, "no forecast")
-    cap = bat.capacity_wh
-    usable_now = cap * max(0.0, bat.soc_pct - bat.min_soc) / 100.0
-    headroom_now = cap * max(0.0, bat.max_soc - bat.soc_pct) / 100.0
-    cap_usable = cap * max(0.0, bat.max_soc - bat.min_soc) / 100.0
+    usable_now = bat.wh_per_pct * max(0.0, bat.soc_pct - bat.min_soc)
+    headroom_now = bat.wh_per_pct * max(0.0, bat.max_soc - bat.soc_pct)
+    cap_usable = bat.wh_per_pct * max(0.0, bat.max_soc - bat.min_soc)
     per_bucket_charge = bat.charge_power_w * BUCKET_H
     if econ.import_cap_w > 0:
         per_bucket_charge = min(per_bucket_charge, econ.import_cap_w * BUCKET_H)
@@ -463,7 +535,7 @@ def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> Arbi
         )
 
     grid_now = min(purchases[0], headroom_now)
-    target_soc = bat.soc_pct + 100.0 * grid_now / cap
+    target_soc = bat.soc_pct + grid_now / bat.wh_per_pct
     common = dict(next_need_idx=first_need, next_need_price_ct=need_price)
     if grid_now < 1.0:
         buy_j = min((j for _i, _p, j, _pb, _w in matched), default=None)

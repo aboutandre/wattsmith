@@ -123,6 +123,15 @@ DRIFT_HISTORY_DAYS: Final[int] = 90              # history the fits look back ov
 DRIFT_STATE_DAYS: Final[int] = 15                # "since last full" lookback per tick
 DRIFT_MIN_WINDOWS: Final[int] = 4                # resets per battery before its own rate is used
 DRIFT_MAX_GAP_BUCKETS: Final[int] = 4            # restart gaps tolerated by drift fit + reset log (η: none)
+# Socket Wh per displayed SOC Wh (hel-139, soc_drift.fit_delivery_factor). A short
+# window on purpose: the factor includes the BMS drift, which changes with the
+# charge pattern (and resets on every full charge), so recent behaviour counts.
+DELIVERY_HISTORY_DAYS: Final[int] = 7
+DELIVERY_MIN_POINTS: Final[float] = 100.0         # summed SOC drop before it is trusted (~1 night)
+DELIVERY_VALID_RANGE: Final[tuple[float, float]] = (0.6, 1.0)  # outside -> reject, keep fallback
+# Grid export while the fleet covers the house (hel-139, arbitrage.fit_discharge_overhead_w),
+# same DELIVERY_HISTORY_DAYS window. Rejected outside this range (W).
+OVERHEAD_VALID_RANGE_W: Final[tuple[float, float]] = (0.0, 500.0)
 
 # SOC calibration (hel-134). A battery is due once its PREDICTED drift reaches the
 # threshold (learned per battery: points per kWh discharged since its last full
@@ -135,6 +144,10 @@ DEFAULT_CALIBRATION_MAX_DAYS: Final[float] = 7.0
 DEFAULT_CALIBRATION_GRID: Final[bool] = True
 CALIBRATION_GRID_EXTRA_PTS: Final[float] = 4.0
 CALIBRATION_LOOKAHEAD_BUCKETS: Final[int] = 96   # cheapest window searched within 24 h
+# A grid top-up that is already running is only moved to a later window that is
+# more than this much cheaper (and only if nothing dearer comes in between):
+# see soc_drift.plan_calibration, hel-139.
+CALIBRATION_COMMIT_MARGIN_CT: Final[float] = 3.0
 DEFAULT_MIN_ARBITRAGE_MARGIN_CT: Final[float] = 1.5   # skip sub-margin churn
 # Plan against the mean of Solcast's central and p10 estimates: missing a deficit
 # costs a peak-price import, overshooting costs only the spread plus wear.
