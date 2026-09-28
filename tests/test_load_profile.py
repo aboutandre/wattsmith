@@ -97,6 +97,31 @@ def test_energy_between_counts_partial_buckets():
     assert prof.energy_between(t0, t0 + 3600) == pytest.approx(400.0)
 
 
+def test_day_forecast_is_the_planners_numbers_from_midnight():
+    """The display forecast is load_at itself, bucket by bucket, from local midnight."""
+    days = _flat_days("2026-08-01", 28, bump_weekday=5, bump=60.0)   # Saturdays higher
+    prof = lp.fit_load_profile(_rows(days), _ts("2026-08-29"))
+    fc = lp.day_forecast(prof.at, _ts("2026-08-28", 14, 7))           # a Friday afternoon
+    assert len(fc["points"]) == 2 * 96
+    assert fc["points"][0][0] == _ts("2026-08-28")
+    assert fc["points"][96][0] == _ts("2026-08-29")
+    assert all(wh == prof.at(ts) for ts, wh in fc["points"])
+    assert fc["day_wh"][0] == pytest.approx(sum(wh for _, wh in fc["points"][:96]))
+    assert fc["day_wh"][1] > fc["day_wh"][0]                         # Saturday is learned
+
+
+def test_day_forecast_follows_dst():
+    """25 Oct 2026 (Berlin) has 25 hours: 100 buckets, and tomorrow starts at local midnight."""
+    fc = lp.day_forecast(lambda ts: 10.0, _ts("2026-10-25", 12))
+    assert len(fc["points"]) == 100 + 96
+    assert fc["points"][100][0] == _ts("2026-10-26")
+    assert fc["day_wh"] == [1000.0, 960.0]
+
+
+def test_day_forecast_without_a_forecast_is_none():
+    assert lp.day_forecast(None, _ts("2026-08-28")) is None
+
+
 def test_each_bucket_uses_its_own_weekday():
     # the old per-hour list applied TODAY's weekday to the whole horizon
     days = _flat_days("2026-08-01", 28, bump_weekday=6, bump=100.0)   # Sundays
