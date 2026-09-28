@@ -55,7 +55,7 @@ hel-127). Pure: no Home Assistant, no I/O.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 SLOTS_PER_DAY = 96
 SLOTS_PER_WEEK = 7 * SLOTS_PER_DAY
@@ -147,3 +147,30 @@ def fit_load_profile(
         week = [sum(week[(i + j) % SLOTS_PER_WEEK] for j in range(-k, k + 1)) / (2 * k + 1)
                 for i in range(SLOTS_PER_WEEK)]
     return LoadProfile(wh=tuple(week), days=len(by_day))
+
+
+def day_forecast(load_at, now_ts: float, days: int = 2) -> dict | None:
+    """The load forecast from local midnight today over `days` days, for display.
+
+    `load_at` is the same Wh-per-bucket function the planner uses (the fitted
+    profile's `at`, or the BaselineLearner fallback), so what this returns is
+    exactly what the planner and the adaptive gate count with. Starting at
+    midnight rather than now lets a chart put the forecast for the hours already
+    gone next to what the house actually used. Day boundaries are local and follow
+    DST (a 23 h or 25 h day has 92 or 100 buckets).
+    """
+    if load_at is None:
+        return None
+    midnight = datetime.fromtimestamp(now_ts).replace(hour=0, minute=0, second=0, microsecond=0)
+    bounds = [(midnight + timedelta(days=i)).timestamp() for i in range(days + 1)]
+    points: list[tuple[float, float]] = []
+    totals: list[float] = []
+    for d in range(days):
+        ts, total = bounds[d], 0.0
+        while ts < bounds[d + 1]:
+            wh = float(load_at(ts))
+            points.append((ts, wh))
+            total += wh
+            ts += BUCKET_S
+        totals.append(total)
+    return {"points": points, "day_wh": totals}

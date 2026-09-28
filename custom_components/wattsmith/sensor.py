@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -13,6 +13,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .ev_coordinator import EvCoordinator
 from .manager import EnergyManagerCoordinator
+from .settings import LOAD_PROFILE_WINDOW_DAYS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -76,6 +77,8 @@ ARBITRAGE_SENSORS: tuple[tuple[str, str, str | None, str | None, str], ...] = (
     ("eta", "Round-Trip Efficiency", "%", None, "mdi:sync"),
     ("wear_ct", "Battery Wear Cost", None, None, "mdi:battery-heart-variant"),
     ("calibration_status", "SOC Calibration", None, None, "mdi:battery-sync"),
+    # the house-load forecast the planner uses, for today (state) and tomorrow
+    ("load_forecast_today_kwh", "House Load Forecast", "kWh", None, "mdi:home-clock"),
 )
 
 # Adaptive PV charging sub-keys (read from coordinator.data["adaptive"]).
@@ -172,6 +175,8 @@ class ArbitrageSensor(CoordinatorEntity, SensorEntity):
     """Advisory arbitrage + economics sensor (reads the arbitrage coordinator)."""
 
     _attr_has_entity_name = True
+    # the 15-min forecast list is ~10 kB and changes every tick: not for the recorder
+    _unrecorded_attributes = frozenset({"forecast"})
 
     def __init__(self, coordinator, entry_id, title, desc) -> None:
         super().__init__(coordinator)
@@ -182,6 +187,9 @@ class ArbitrageSensor(CoordinatorEntity, SensorEntity):
         self._attr_device_class = device_class
         self._attr_icon = icon
         self._attr_unique_id = f"{entry_id}_arb_{key}"
+        if key == "load_forecast_today_kwh":
+            # long-term statistics keep each day's forecast, to set against the actual load
+            self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_device_info = {
             "identifiers": {(DOMAIN, entry_id)},
             "name": title,
@@ -199,6 +207,18 @@ class ArbitrageSensor(CoordinatorEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         data = self.coordinator.data or {}
+        if self._key == "load_forecast_today_kwh":
+            return {
+                "tomorrow_kwh": data.get("load_forecast_tomorrow_kwh"),
+                # profile = history DB (load_profile.py); learner = the hourly
+                # BaselineLearner + Adaptive Baseline Load, before a week of history
+                "source": data.get("load_source"),
+                "profile_days": data.get("load_profile_days"),
+                "window_days": LOAD_PROFILE_WINDOW_DAYS,
+                # 15-min buckets from local midnight today to the end of tomorrow:
+                # [{"start": local ISO time, "wh": expected Wh in that bucket}]
+                "forecast": data.get("load_forecast"),
+            }
         if self._key == "calibration_status":
             return {
                 "reason": data.get("calibration_reason"),

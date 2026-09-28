@@ -37,7 +37,7 @@ from .arbitrage import (
     with_discharge_overhead,
 )
 from .battery_bridge import BatteryBridge
-from .load_profile import LoadProfile, fit_load_profile
+from .load_profile import LoadProfile, day_forecast, fit_load_profile
 from .const import (
     CONF_ADAPTIVE_CEILING_SOC,
     CONF_ARBITRAGE_ENABLED,
@@ -585,8 +585,7 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
                 "eta_override": self.eta_override, **self._eta_detail,
                 "delivery_factor": delivery, "delivery_source": delivery_src,
                 "discharge_overhead_w": overhead_w, "discharge_overhead_source": overhead_src,
-                "load_source": load_src,
-                "load_profile_days": self._load_profile.days if self._load_profile else 0,
+                **self._load_forecast(load_at, load_src),
                 "ceiling_lifted": self._ceiling_lifted, "ceiling_lift_soc": hard_max,
                 "ceiling_lift_gain_ct": round(lift_gain, 1),
                 **self._delivery_detail,
@@ -609,7 +608,38 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
             "eta_override": self.eta_override, **self._eta_detail,
             "horizon_buckets": 0, "enabled": self.enabled,
             "calibration_status": self._calibration.status if self._calibration else None,
+            # the house still uses energy without batteries: keep the forecast visible
+            **self._load_forecast(*self._load_at()),
         }
+
+    def _load_forecast(self, load_at, source: str) -> dict[str, Any]:
+        """Today's and tomorrow's house-load forecast, exactly as the planner counts it.
+
+        For the House Load Forecast sensor, so a dashboard can plot the planner's own
+        numbers next to the actual load instead of re-deriving a forecast of its own.
+        """
+        import time
+        out: dict[str, Any] = {
+            "load_source": source,
+            "load_profile_days": self._load_profile.days if self._load_profile else 0,
+            "load_forecast": None, "load_forecast_today_kwh": None,
+            "load_forecast_tomorrow_kwh": None,
+        }
+        try:
+            fc = day_forecast(load_at, time.time())
+        except Exception as err:  # noqa: BLE001 - display only, must never break the tick
+            _LOGGER.warning("arbitrage: load forecast for display failed: %s", err)
+            return out
+        if fc is None:
+            return out
+        out["load_forecast"] = [
+            {"start": dt_util.as_local(dt_util.utc_from_timestamp(ts)).isoformat(),
+             "wh": round(wh, 1)}
+            for ts, wh in fc["points"]
+        ]
+        out["load_forecast_today_kwh"] = round(fc["day_wh"][0] / 1000.0, 2)
+        out["load_forecast_tomorrow_kwh"] = round(fc["day_wh"][1] / 1000.0, 2)
+        return out
 
     def _write_advisory(self, plan, eta: float, wear: float) -> None:
         """Best-effort stamp the current bucket's advisory columns in the DB."""
