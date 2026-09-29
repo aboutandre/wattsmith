@@ -414,3 +414,34 @@ if __name__ == "__main__":
         t()
         print(f"  PASS {t.__name__}")
     print(f"\n{len(tests)} planner tests passed ✓")
+
+
+# ---- the arbitrage discharge hold reaches the controller (hel-142) -------
+# The manager hands the hold floor to the planner as BatteryReading.min_soc.
+# Until v0.17.1 the planner built the controller's batteries from its own
+# cfg.min_soc and silently dropped it: on 2026-09-28/29 the hold sat at the
+# fleet SOC all night (30% at 02:00) while the batteries kept delivering
+# ~110 W each, and the fleet reached the 07:00 peak empty.
+def _held(socs, floor):
+    return [BatteryReading(id=f"b{i}", soc=s, min_soc=floor) for i, s in enumerate(socs)]
+
+
+def test_discharge_hold_floor_stops_discharge():
+    p = make(min_soc=13.0)
+    for t in range(0, 30, 3):                       # house drawing ~350 W
+        pl = p.plan(ob(100 + t, 350.0, batteries=_held([30, 30, 30], 30.0)))
+    assert all(v <= 0 for v in pl.setpoints.values()), pl.setpoints
+
+
+def test_discharge_allowed_above_the_hold_floor():
+    p = make(min_soc=13.0)
+    for t in range(0, 30, 3):
+        pl = p.plan(ob(100 + t, 350.0, batteries=_held([30, 30, 30], 20.0)))
+    assert sum(pl.setpoints.values()) > 200, pl.setpoints
+
+
+def test_hold_floor_below_the_configured_minimum_never_lowers_it():
+    p = make(min_soc=13.0)
+    for t in range(0, 30, 3):
+        pl = p.plan(ob(100 + t, 350.0, batteries=_held([13, 13, 13], 5.0)))
+    assert all(v <= 0 for v in pl.setpoints.values()), pl.setpoints

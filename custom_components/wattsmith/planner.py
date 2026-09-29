@@ -219,9 +219,18 @@ class DispatchPlanner:
                 self._stalled[b.id] = stalled
                 if stalled:
                     stalled_ids.append(b.id)
+                # The floor this battery may not be discharged below: the configured
+                # minimum, raised by the manager's per-tick floor on the reading (the
+                # arbitrage discharge hold, which keeps stored energy for dearer
+                # hours). Until v0.17.1 this used cfg.min_soc alone and silently
+                # dropped the hold: it was computed and shown but never reached the
+                # controller, so the fleet kept covering a 33 ct night and hit the
+                # 41 ct morning empty (2026-09-29, hel-142). Stall detection above
+                # stays on cfg.min_soc: it looks for the HARDWARE floor, not the hold.
+                floor = max(cfg.min_soc, b.min_soc)
                 healthy.append(BatteryState(
                     id=b.id, soc=soc, power=int(b.power),
-                    min_soc=max(cfg.min_soc, soc) if stalled else cfg.min_soc,
+                    min_soc=max(floor, soc) if stalled else floor,
                     max_soc=cfg.max_battery_soc,
                     max_power=cfg.max_battery_power,
                 ))

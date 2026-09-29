@@ -405,3 +405,27 @@ def test_ev_right_of_way_still_caps_a_lifted_ceiling():
     mgr._ev_solar_reserve_soc = lambda: 60.0
     _tick(mgr)
     assert mgr.planner.config.max_battery_soc == 60.0
+
+
+# ── the discharge hold reaches the battery commands (hel-142) ─────────────────
+def test_arbitrage_hold_floor_stops_the_batteries_discharging():
+    # the whole path: arbitrage coordinator -> manager -> planner -> controller.
+    # Until v0.17.1 the planner dropped the floor, and this commanded ~110 W each
+    # from 30% batteries with the hold at 30% (2026-09-29 02:00).
+    mgr = make_manager({"min_soc": 13.0}, {"sensor.grid": _grid_state(350)},
+                       [_bat("f9", 30.0), _bat("f10", 30.0, device="d2"),
+                        _bat("f11", 30.0, device="d3")])
+    mgr.hass.data.setdefault(DOMAIN, {})["mgr_entry_arb"] = _fake_arb(hold_floor_soc=30.0)
+    for _ in range(4):
+        result = _tick(mgr)
+    assert result["command_total"] <= 0, result["setpoints"]
+
+
+def test_without_a_hold_the_same_house_is_covered_from_the_batteries():
+    mgr = make_manager({"min_soc": 13.0}, {"sensor.grid": _grid_state(350)},
+                       [_bat("f9", 30.0), _bat("f10", 30.0, device="d2"),
+                        _bat("f11", 30.0, device="d3")])
+    mgr.hass.data.setdefault(DOMAIN, {})["mgr_entry_arb"] = _fake_arb(hold_floor_soc=None)
+    for _ in range(4):
+        result = _tick(mgr)
+    assert result["command_total"] > 200, result["setpoints"]
