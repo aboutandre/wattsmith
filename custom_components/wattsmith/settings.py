@@ -104,6 +104,14 @@ HISTORY_RETENTION_DAYS: Final[int] = 0           # 0 = keep forever (the DB is t
 # per battery per heartbeat while an outage is timestamped to the probe interval.
 HISTORY_HEALTH_PROBE_S: Final[float] = 60.0
 HISTORY_HEALTH_HEARTBEAT_S: Final[float] = 900.0
+# Solcast forecast snapshots (hel-132): at each local wall-clock time below, the whole
+# day-ahead forecast (p50/p10/p90 per 30-min period) is copied into pv_forecast_snapshot.
+# 13:15 is just after tomorrow's Tibber prices publish (~13:00), when the planner first
+# sees tomorrow; 21:00 is the last plan before the overnight cheap window. "HH:MM", local.
+HISTORY_FORECAST_SNAPSHOT_TIMES: Final[tuple[str, ...]] = ("13:15", "21:00")
+# After a start/reload, wait this long (Solcast may load after Wattsmith) and then take
+# any snapshot that came due while HA was down, so a restart doesn't lose a day's sample.
+HISTORY_SNAPSHOT_CATCHUP_DELAY_S: Final[float] = 120.0
 DEFAULT_EXPORT_PRICE: Final[float] = 0.07        # feed-in tariff EUR/kWh (opportunity cost)
 
 # === Battery economics / arbitrage ===========================================

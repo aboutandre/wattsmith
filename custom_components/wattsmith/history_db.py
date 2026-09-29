@@ -34,8 +34,13 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import (
+    async_call_later,
+    async_track_time_change,
+    async_track_time_interval,
+)
 
+from .arbitrage import solcast_forecast_entities
 from .battery_bridge import BatteryBridge
 from .const import (
     CONF_EXPORT_PRICE,
@@ -52,16 +57,20 @@ from .const import (
 from .safety import SOURCE_ACK, SOURCE_READ
 from .settings import (
     DEFAULT_EXPORT_PRICE,
+    HISTORY_FORECAST_SNAPSHOT_TIMES,
     HISTORY_HEALTH_HEARTBEAT_S,
     HISTORY_HEALTH_PROBE_S,
     HISTORY_RETENTION_DAYS,
     HISTORY_SAMPLE_INTERVAL_S,
+    HISTORY_SNAPSHOT_CATCHUP_DELAY_S,
     HOUSE_CONSUMPTION_SENSOR,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3  # 2: + battery_health liveness log; 3: + calibration (bucket column + event log)
+# 2: + battery_health liveness log; 3: + calibration (bucket column + event log);
+# 4: + p10/p90 forecast on the bucket, + pv_forecast_snapshot (day-ahead Solcast log)
+SCHEMA_VERSION = 4
 BUCKET_SECONDS = 900  # 15 minutes
 _UNAVAILABLE = ("unknown", "unavailable", "none", "")
 
@@ -71,6 +80,8 @@ CREATE TABLE IF NOT EXISTS bucket (
   local_start     TEXT NOT NULL,
   pv_wh              REAL,
   pv_forecast_wh     REAL,
+  pv_forecast_p10_wh REAL,   -- Solcast pessimistic (p10) for the same slot
+  pv_forecast_p90_wh REAL,   -- Solcast optimistic (p90) for the same slot
   house_wh           REAL,
   ev_wh              REAL,
   grid_import_wh     REAL,
@@ -158,6 +169,21 @@ CREATE TABLE IF NOT EXISTS calibration_event (
   missing_buckets  INTEGER,            -- logging gaps in the window (discharged_kwh slightly low)
   PRIMARY KEY (ts, battery_id)
 );
+-- What Solcast promised, and when. One row per 30-min period per snapshot; the same
+-- target period appears once per snapshot that covered it, so lead time is a column.
+CREATE TABLE IF NOT EXISTS pv_forecast_snapshot (
+  taken_ts     INTEGER NOT NULL,   -- when the snapshot was taken (epoch)
+  period_ts    INTEGER NOT NULL,   -- start of the forecast period (epoch)
+  lead_h       REAL NOT NULL,      -- (period start - taken) in hours; < 0 = period already running
+  p50_wh       REAL NOT NULL,      -- central estimate, energy over the period
+  p10_wh       REAL,               -- pessimistic (NULL if Solcast gave none)
+  p90_wh       REAL,               -- optimistic
+  taken_local  TEXT NOT NULL,
+  period_local TEXT NOT NULL,
+  PRIMARY KEY (taken_ts, period_ts)
+);
+CREATE INDEX IF NOT EXISTS pv_forecast_snapshot_by_period
+  ON pv_forecast_snapshot (period_ts, taken_ts);
 CREATE TABLE IF NOT EXISTS meta ( key TEXT PRIMARY KEY, value TEXT );
 """
 
@@ -165,7 +191,7 @@ CREATE TABLE IF NOT EXISTS meta ( key TEXT PRIMARY KEY, value TEXT );
 # table name is interpolated into SQL, so anything outside this set is rejected
 # before it ever reaches sqlite).
 QUERY_TABLES = ("bucket", "battery_bucket", "battery_health", "config_snapshot", "config_event",
-                "calibration_event")
+                "calibration_event", "pv_forecast_snapshot")
 _QUERY_TS_COLUMN = {
     "bucket": "ts_start",
     "battery_bucket": "ts_start",
@@ -173,7 +199,20 @@ _QUERY_TS_COLUMN = {
     "config_snapshot": "ts",
     "config_event": "ts",
     "calibration_event": "ts",
+    # keyed on the TARGET period, so a window of days returns every forecast made for
+    # them (day-ahead and same-day) next to the bucket actuals for the same window.
+    "pv_forecast_snapshot": "period_ts",
 }
+# Tie-break for tables where many rows share the timestamp column.
+_QUERY_TIEBREAK = {"pv_forecast_snapshot": "taken_ts"}
+
+# bucket columns added after v1: (name, type). CREATE IF NOT EXISTS leaves an existing
+# table as it was, so _init_db adds whichever of these an older DB is missing.
+_BUCKET_MIGRATIONS = (
+    ("calibration_status", "TEXT"),      # v3
+    ("pv_forecast_p10_wh", "REAL"),      # v4
+    ("pv_forecast_p90_wh", "REAL"),      # v4
+)
 
 # Calibration status stamped on a bucket = the most significant one seen during it,
 # so a bucket that grid-charged and ended "ok" still says it grid-charged.
@@ -252,6 +291,138 @@ def _split_scope_key(dotted: str) -> tuple[str, str]:
     return "global", dotted
 
 
+def _parse_period_start(value: Any) -> datetime | None:
+    """A detailedForecast `period_start` as an aware datetime (naive -> UTC), or None."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _kw(value: Any) -> float | None:
+    """A Solcast kW figure as a float, or None when absent or not a number."""
+    try:
+        return float(value) if value is not None else None
+    except (ValueError, TypeError):
+        return None
+
+
+def forecast_levels_at(
+    periods: Any, now: datetime
+) -> tuple[float | None, float | None, float | None]:
+    """(p50, p10, p90) in W for the period covering `now`, from a detailedForecast list.
+
+    The period is the last one that started at or before `now`. Anything missing is
+    None: the p10/p90 columns record what Solcast said, so they stay NULL rather than
+    borrowing p50 (the planner's own fallback lives in arbitrage.pv_slots_from_detailed).
+    """
+    if not isinstance(periods, list):
+        return None, None, None
+    best: dict[str, Any] | None = None
+    for p in periods:
+        start = _parse_period_start(p.get("period_start")) if isinstance(p, dict) else None
+        if start is None:
+            continue
+        if start <= now:
+            best = p
+        else:
+            break
+    if best is None:
+        return None, None, None
+    p50, p10, p90 = (_kw(best.get(k)) for k in ("pv_estimate", "pv_estimate10", "pv_estimate90"))
+    return (
+        None if p50 is None else p50 * 1000.0,
+        None if p10 is None else p10 * 1000.0,
+        None if p90 is None else p90 * 1000.0,
+    )
+
+
+SNAPSHOT_DEFAULT_PERIOD_S = 1800  # Solcast detailedForecast is 30-min; used for a one-period list
+
+
+def forecast_snapshot_rows(periods: Any, taken_ts: int) -> list[dict[str, Any]]:
+    """pv_forecast_snapshot rows from one Solcast detailedForecast list (hel-132).
+
+    - Only periods still to come (or running) at `taken_ts` are kept: an earlier period
+      on the same-day sensor is hindsight, not forecast, and would corrupt lead-time stats.
+    - Energy per period = kW x period length. The length is the spacing of the list (30
+      min for Solcast), so the Wh stay right if the granularity ever changes.
+    - lead_h comes from epoch seconds, so it is exact across midnight and DST changes.
+    - A period with no p50 is dropped; a missing p10/p90 is stored as NULL.
+    """
+    if not isinstance(periods, list):
+        return []
+    parsed: list[tuple[int, dict[str, Any]]] = []
+    for p in periods:
+        start = _parse_period_start(p.get("period_start")) if isinstance(p, dict) else None
+        if start is not None:
+            parsed.append((int(start.timestamp()), p))
+    if not parsed:
+        return []
+    parsed.sort(key=lambda item: item[0])
+    gaps = [b[0] - a[0] for a, b in zip(parsed, parsed[1:]) if b[0] > a[0]]
+    period_s = min(gaps) if gaps else SNAPSHOT_DEFAULT_PERIOD_S
+
+    def wh(value: Any) -> float | None:
+        kw = _kw(value)
+        return None if kw is None else round(kw * 1000.0 * period_s / 3600.0, 2)
+
+    taken_local = datetime.fromtimestamp(taken_ts).isoformat(timespec="seconds")
+    rows: list[dict[str, Any]] = []
+    for ts, p in parsed:
+        if ts + period_s <= taken_ts:
+            continue
+        p50 = wh(p.get("pv_estimate"))
+        if p50 is None:
+            continue
+        rows.append({
+            "taken_ts": taken_ts,
+            "period_ts": ts,
+            "lead_h": round((ts - taken_ts) / 3600.0, 4),
+            "p50_wh": p50,
+            "p10_wh": wh(p.get("pv_estimate10")),
+            "p90_wh": wh(p.get("pv_estimate90")),
+            "taken_local": taken_local,
+            "period_local": datetime.fromtimestamp(ts).isoformat(timespec="seconds"),
+        })
+    return rows
+
+
+def parse_snapshot_times(times: Any) -> list[tuple[int, int]]:
+    """['13:15', '21:00'] -> [(13, 15), (21, 0)]; malformed entries are skipped, not fatal."""
+    out: set[tuple[int, int]] = set()
+    for raw in times or ():
+        try:
+            hh, mm = str(raw).strip().split(":")
+            hour, minute = int(hh), int(mm)
+        except ValueError:
+            _LOGGER.warning("ignoring malformed forecast snapshot time %r (want 'HH:MM')", raw)
+            continue
+        if 0 <= hour < 24 and 0 <= minute < 60:
+            out.add((hour, minute))
+        else:
+            _LOGGER.warning("ignoring out-of-range forecast snapshot time %r", raw)
+    return sorted(out)
+
+
+def latest_due_snapshot(now: datetime, times: list[tuple[int, int]]) -> datetime | None:
+    """The most recent scheduled snapshot instant at or before `now` (today or yesterday).
+
+    Used at startup to tell whether a snapshot came due while HA was down.
+    """
+    due = [
+        (now - timedelta(days=back)).replace(hour=h, minute=m, second=0, microsecond=0)
+        for back in (0, 1)
+        for h, m in times
+    ]
+    due = [d for d in due if d <= now]
+    return max(due) if due else None
+
+
 @dataclass
 class BatteryAccum:
     """Per-battery energy/SOC accumulation within one bucket."""
@@ -290,6 +461,8 @@ class Sample:
     ev_w: float | None = None
     grid_w: float | None = None          # + import, - export
     pv_forecast_w: float | None = None
+    pv_forecast_p10_w: float | None = None
+    pv_forecast_p90_w: float | None = None
     price_import: float | None = None
     price_export: float | None = None
     outdoor_temp_c: float | None = None
@@ -313,6 +486,10 @@ class BucketAccumulator:
     export_wh: float = 0.0
     pv_forecast_wh: float = 0.0
     _forecast_seen: bool = False
+    pv_forecast_p10_wh: float = 0.0
+    _p10_seen: bool = False
+    pv_forecast_p90_wh: float = 0.0
+    _p90_seen: bool = False
     fleet_soc_start: float | None = None
     fleet_soc_end: float | None = None
     price_import: float | None = None
@@ -342,6 +519,12 @@ class BucketAccumulator:
         if sample.pv_forecast_w is not None and dt_s > 0:
             self.pv_forecast_wh += max(0.0, sample.pv_forecast_w) * dt_s / 3600.0
             self._forecast_seen = True
+        if sample.pv_forecast_p10_w is not None and dt_s > 0:
+            self.pv_forecast_p10_wh += max(0.0, sample.pv_forecast_p10_w) * dt_s / 3600.0
+            self._p10_seen = True
+        if sample.pv_forecast_p90_w is not None and dt_s > 0:
+            self.pv_forecast_p90_wh += max(0.0, sample.pv_forecast_p90_w) * dt_s / 3600.0
+            self._p90_seen = True
         # snapshots (representative = last seen; start = first seen)
         if sample.fleet_soc is not None:
             if self.fleet_soc_start is None:
@@ -375,6 +558,8 @@ class BucketAccumulator:
             "local_start": local,
             "pv_wh": round(self.pv_wh, 2),
             "pv_forecast_wh": round(self.pv_forecast_wh, 2) if self._forecast_seen else None,
+            "pv_forecast_p10_wh": round(self.pv_forecast_p10_wh, 2) if self._p10_seen else None,
+            "pv_forecast_p90_wh": round(self.pv_forecast_p90_wh, 2) if self._p90_seen else None,
             "house_wh": round(self.house_wh, 2),
             "ev_wh": round(self.ev_wh, 2),
             "grid_import_wh": round(self.import_wh, 2),
@@ -442,6 +627,9 @@ class HistoryRecorder:
         # battery liveness: last row written per battery, for change detection
         self._health_last: dict[str, tuple[bool, int, bool]] = {}
         self._health_last_write: dict[str, float] = {}
+        # Solcast forecast snapshots (hel-132): local wall-clock schedule + its listeners
+        self._snapshot_times = parse_snapshot_times(HISTORY_FORECAST_SNAPSHOT_TIMES)
+        self._unsub_snapshots: list[Any] = []
 
     # ---- lifecycle ------------------------------------------------------
     async def async_start(self) -> None:
@@ -454,6 +642,16 @@ class HistoryRecorder:
         self._unsub_health = async_track_time_interval(
             self.hass, self._health_cb, timedelta(seconds=HISTORY_HEALTH_PROBE_S)
         )
+        for hour, minute in self._snapshot_times:
+            self._unsub_snapshots.append(
+                async_track_time_change(
+                    self.hass, self._snapshot_cb, hour=hour, minute=minute, second=0
+                )
+            )
+        if self._snapshot_times:
+            self._unsub_snapshots.append(
+                async_call_later(self.hass, HISTORY_SNAPSHOT_CATCHUP_DELAY_S, self._catchup_cb)
+            )
         self._started = True
         _LOGGER.info("Wattsmith history DB active at %s", self._db_path)
 
@@ -464,6 +662,9 @@ class HistoryRecorder:
         if self._unsub_health is not None:
             self._unsub_health()
             self._unsub_health = None
+        for unsub in self._unsub_snapshots:
+            unsub()
+        self._unsub_snapshots = []
         # flush the partial bucket so a restart doesn't lose it
         if self._accum is not None and self._accum.sample_count > 0:
             await self._flush(self._accum)
@@ -580,6 +781,7 @@ class HistoryRecorder:
 
     def _read_sample(self) -> Sample:
         o = self.entry.options
+        fc_p50, fc_p10, fc_p90 = self._forecast_levels_w(o.get(CONF_SOLCAST_FORECAST_SENSOR))
         batteries: dict[str, tuple[float | None, float | None, float | None]] = {}
         socs: list[tuple[float, float]] = []
         for st in self.bridge.read_all():
@@ -595,7 +797,9 @@ class HistoryRecorder:
             house_w=self._num(o.get(CONF_HOUSE_CONSUMPTION_SENSOR) or HOUSE_CONSUMPTION_SENSOR),
             ev_w=self._ev_power(),
             grid_w=self._num(o.get(CONF_GRID_SENSOR) or self.entry.data.get(CONF_GRID_SENSOR)),
-            pv_forecast_w=self._forecast_w(o.get(CONF_SOLCAST_FORECAST_SENSOR)),
+            pv_forecast_w=fc_p50,
+            pv_forecast_p10_w=fc_p10,
+            pv_forecast_p90_w=fc_p90,
             price_import=self._num(o.get(CONF_TIBBER_SENSOR)),
             price_export=float(o.get(CONF_EXPORT_PRICE, DEFAULT_EXPORT_PRICE)),
             outdoor_temp_c=self._weather_temp(o.get(CONF_WEATHER_SENSOR)),
@@ -650,42 +854,22 @@ class HistoryRecorder:
         except (ValueError, TypeError):
             return None
 
-    def _forecast_w(self, entity_id: str | None) -> float | None:
-        """Best-effort per-slot PV forecast (W) from a Solcast detailed sensor.
+    def _forecast_levels_w(
+        self, entity_id: str | None
+    ) -> tuple[float | None, float | None, float | None]:
+        """Best-effort (p50, p10, p90) PV forecast in W for the slot covering now.
 
-        Solcast's forecast-today sensor carries a `detailedForecast` /
-        `detailedHourly` attribute: a list of {period_start, pv_estimate(kW)}.
-        Find the period covering now. Any missing piece -> None (column stays null).
+        Solcast's forecast-today sensor carries a `detailedForecast` / `detailedHourly`
+        attribute: a list of {period_start, pv_estimate, pv_estimate10, pv_estimate90}
+        in kW. Any missing piece -> None (that column stays null).
         """
         if not entity_id:
-            return None
+            return None, None, None
         st = self.hass.states.get(entity_id)
         if st is None or not st.attributes:
-            return None
+            return None, None, None
         periods = st.attributes.get("detailedForecast") or st.attributes.get("detailedHourly")
-        if not isinstance(periods, list):
-            return None
-        now = datetime.now(timezone.utc)
-        best = None
-        for p in periods:
-            start = p.get("period_start")
-            if isinstance(start, str):
-                try:
-                    start = datetime.fromisoformat(start)
-                except ValueError:
-                    continue
-            if not isinstance(start, datetime):
-                continue
-            if start.tzinfo is None:
-                start = start.replace(tzinfo=timezone.utc)
-            if start <= now:
-                best = p.get("pv_estimate")
-            else:
-                break
-        try:
-            return float(best) * 1000.0 if best is not None else None
-        except (ValueError, TypeError):
-            return None
+        return forecast_levels_at(periods, datetime.now(timezone.utc))
 
     # ---- config versioning ----------------------------------------------
     async def async_on_config_change(self, source: str = "options") -> None:
@@ -722,10 +906,11 @@ class HistoryRecorder:
         conn = self._connect()
         try:
             conn.executescript(SCHEMA)
-            # v3 migration: CREATE IF NOT EXISTS leaves an existing bucket table as is
+            # CREATE IF NOT EXISTS leaves an existing bucket table as is: add what it lacks
             cols = {r[1] for r in conn.execute("PRAGMA table_info(bucket)")}
-            if "calibration_status" not in cols:
-                conn.execute("ALTER TABLE bucket ADD COLUMN calibration_status TEXT")
+            for name, ctype in _BUCKET_MIGRATIONS:
+                if name not in cols:
+                    conn.execute(f"ALTER TABLE bucket ADD COLUMN {name} {ctype}")
             conn.execute(
                 "INSERT OR IGNORE INTO meta(key,value) VALUES('created_at',?)",
                 (datetime.now().isoformat(timespec="seconds"),),
@@ -869,6 +1054,76 @@ class HistoryRecorder:
         finally:
             conn.close()
 
+    # ---- Solcast forecast snapshots (hel-132) ---------------------------
+    async def _snapshot_cb(self, _now) -> None:
+        await self.async_snapshot_forecast()
+
+    async def _catchup_cb(self, _now) -> None:
+        """After a start/reload: take the snapshot that came due while HA was down."""
+        try:
+            due = latest_due_snapshot(datetime.now(), self._snapshot_times)
+            if due is None:
+                return
+            last = await self.hass.async_add_executor_job(self._last_snapshot_ts)
+            if last is None or last < int(due.timestamp()):
+                _LOGGER.info("Solcast forecast snapshot due %s was missed; taking it now", due)
+                await self.async_snapshot_forecast()
+        except Exception as err:  # noqa: BLE001 - observability must never break HA
+            _LOGGER.warning("Solcast forecast snapshot catch-up failed: %s", err)
+
+    async def async_snapshot_forecast(self) -> int:
+        """Copy Solcast's current day-ahead + rest-of-today forecast into the snapshot table.
+
+        Returns the number of rows written (0 when Solcast has nothing to give).
+        """
+        try:
+            entities = solcast_forecast_entities(
+                self.entry.options.get(CONF_SOLCAST_FORECAST_SENSOR) or ""
+            )
+            if not entities:
+                return 0            # no Solcast sensor configured: nothing to record
+            taken = int(time.time())
+            rows: list[dict[str, Any]] = []
+            for entity_id in entities:
+                st = self.hass.states.get(entity_id)
+                periods = st.attributes.get("detailedForecast") if st is not None and st.attributes else None
+                rows.extend(forecast_snapshot_rows(periods, taken))
+            if not rows:
+                _LOGGER.warning(
+                    "Solcast forecast snapshot: no forecast periods available from %s", entities
+                )
+                return 0
+            await self.hass.async_add_executor_job(self._write_snapshot, rows)
+            _LOGGER.info("Solcast forecast snapshot: %d periods stored", len(rows))
+            return len(rows)
+        except Exception as err:  # noqa: BLE001 - observability must never break HA
+            _LOGGER.warning("Solcast forecast snapshot failed: %s", err)
+            return 0
+
+    def _last_snapshot_ts(self) -> int | None:
+        conn = self._connect()
+        try:
+            return conn.execute("SELECT MAX(taken_ts) FROM pv_forecast_snapshot").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _write_snapshot(self, rows: list[dict[str, Any]]) -> None:
+        conn = self._connect()
+        try:
+            conn.executemany(
+                "INSERT OR IGNORE INTO pv_forecast_snapshot"
+                " (taken_ts, period_ts, lead_h, p50_wh, p10_wh, p90_wh, taken_local, period_local)"
+                " VALUES (:taken_ts, :period_ts, :lead_h, :p50_wh, :p10_wh, :p90_wh,"
+                "         :taken_local, :period_local)",
+                rows,
+            )
+            if self._retention_days > 0:
+                cutoff = int(time.time()) - self._retention_days * 86400
+                conn.execute("DELETE FROM pv_forecast_snapshot WHERE period_ts < ?", (cutoff,))
+            conn.commit()
+        finally:
+            conn.close()
+
     # ---- read-only queries (query_history service) -----------------------
     def query_range(
         self,
@@ -896,7 +1151,8 @@ class HistoryRecorder:
             if table == "battery_bucket" and battery_id:
                 sql += " AND battery_id = ?"
                 params.append(battery_id)
-            sql += f" ORDER BY {ts_col} LIMIT ?"
+            tiebreak = _QUERY_TIEBREAK.get(table)
+            sql += f" ORDER BY {ts_col}" + (f", {tiebreak}" if tiebreak else "") + " LIMIT ?"
             params.append(int(limit))
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]

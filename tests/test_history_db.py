@@ -6,15 +6,17 @@ SQLite round-trip against a temp file — no Home Assistant, no network.
 Run directly:   python3 tests/test_history_db.py
 Or with pytest: pytest tests/test_history_db.py
 """
+import asyncio
 import importlib.util
 import os
 import sqlite3
 import sys
 import tempfile
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # ── stub homeassistant + the wattsmith package deps ──────────────────────────
 sys.modules["homeassistant"] = MagicMock()
@@ -50,6 +52,8 @@ _load("const")
 _load("settings")
 _load("safety")          # history_db reads the fault-source labels from here
 _load("battery_bridge")
+_load("economics")       # arbitrage imports it; history_db reuses solcast_forecast_entities()
+_load("arbitrage")
 h = _load("history_db")
 
 bucket_start = h.bucket_start
@@ -469,6 +473,408 @@ def test_calibration_event_is_queryable():
                                         "discharged_kwh": 2.0, "predicted_pts": None,
                                         "actual_pts": 3.0, "drift_rate": None}])
         assert len(rec.query_range(0, 10**6, table="calibration_event")) == 1
+
+
+# ── v4: Solcast p10/p90 on the bucket + the day-ahead snapshot table (hel-132) ──
+forecast_levels_at = h.forecast_levels_at
+forecast_snapshot_rows = h.forecast_snapshot_rows
+parse_snapshot_times = h.parse_snapshot_times
+latest_due_snapshot = h.latest_due_snapshot
+
+TODAY_ENTITY = "sensor.solcast_pv_forecast_forecast_today"
+TOMORROW_ENTITY = "sensor.solcast_pv_forecast_forecast_tomorrow"
+
+
+def _iso(s: str) -> int:
+    return int(datetime.fromisoformat(s).timestamp())
+
+
+def _period(start: str, p50=None, p10=None, p90=None) -> dict:
+    p = {"period_start": start}
+    if p50 is not None:
+        p["pv_estimate"] = p50
+    if p10 is not None:
+        p["pv_estimate10"] = p10
+    if p90 is not None:
+        p["pv_estimate90"] = p90
+    return p
+
+
+def test_forecast_levels_at_reports_p50_p10_p90_in_watts():
+    periods = [
+        _period("2026-09-30T10:00:00+02:00", 1.0, 0.4, 1.6),
+        _period("2026-09-30T10:30:00+02:00", 2.0, 0.8, 3.2),
+        _period("2026-09-30T11:00:00+02:00", 3.0, 1.2, 4.8),
+    ]
+    now = datetime.fromisoformat("2026-09-30T10:40:00+02:00")
+    assert forecast_levels_at(periods, now) == (2000.0, 800.0, 3200.0)
+
+
+def test_forecast_levels_at_leaves_missing_levels_null_instead_of_borrowing_p50():
+    periods = [_period("2026-09-30T10:00:00+02:00", 1.0)]          # no p10/p90 in the feed
+    now = datetime.fromisoformat("2026-09-30T10:10:00+02:00")
+    assert forecast_levels_at(periods, now) == (1000.0, None, None)
+
+
+def test_forecast_levels_at_is_none_before_the_first_period_or_on_junk():
+    periods = [_period("2026-09-30T10:00:00+02:00", 1.0, 0.4, 1.6)]
+    assert forecast_levels_at(periods, datetime.fromisoformat("2026-09-30T09:59:00+02:00")) \
+        == (None, None, None)
+    now = datetime.now(timezone.utc)
+    for junk in (None, "x", [], [None, "y", {"period_start": "not-a-date"}]):
+        assert forecast_levels_at(junk, now) == (None, None, None)
+
+
+def test_bucket_records_forecast_band_next_to_the_central_estimate():
+    a = BucketAccumulator(ts_start=0)
+    s = Sample(pv_forecast_w=2000, pv_forecast_p10_w=800, pv_forecast_p90_w=3200)
+    a.add(s, 0.0)
+    a.add(s, 900.0)          # one 15-min bucket's worth
+    row = a.bucket_row(1)
+    assert row["pv_forecast_wh"] == 500.0
+    assert row["pv_forecast_p10_wh"] == 200.0
+    assert row["pv_forecast_p90_wh"] == 800.0
+
+
+def test_bucket_forecast_band_is_null_when_solcast_gives_only_a_central_estimate():
+    a = BucketAccumulator(ts_start=0)
+    a.add(Sample(pv_forecast_w=2000), 900.0)
+    row = a.bucket_row(1)
+    assert row["pv_forecast_wh"] == 500.0
+    assert row["pv_forecast_p10_wh"] is None and row["pv_forecast_p90_wh"] is None
+
+
+def test_fresh_db_has_the_forecast_band_columns_and_snapshot_table():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = os.path.join(d, "history.db")
+        _recorder(tmp)._init_db()
+        conn = sqlite3.connect(tmp)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(bucket)")}
+        assert {"pv_forecast_p10_wh", "pv_forecast_p90_wh"} <= cols
+        snap = {r[1] for r in conn.execute("PRAGMA table_info(pv_forecast_snapshot)")}
+        assert snap == {"taken_ts", "period_ts", "lead_h", "p50_wh", "p10_wh", "p90_wh",
+                        "taken_local", "period_local"}
+        conn.close()
+
+
+def _pre_v4_bucket_ddl() -> str:
+    """The current bucket DDL with the v4 band columns cut out = what a v3 DB has."""
+    import re
+    ddl = re.search(r"CREATE TABLE IF NOT EXISTS bucket \(.*?\n\);", h.SCHEMA, re.S).group(0)
+    ddl = ddl.replace("IF NOT EXISTS ", "")
+    return "\n".join(line for line in ddl.splitlines()
+                     if "pv_forecast_p10_wh" not in line and "pv_forecast_p90_wh" not in line)
+
+
+def test_v4_migration_adds_the_forecast_band_to_an_existing_bucket_table():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = os.path.join(d, "history.db")
+        conn = sqlite3.connect(tmp)
+        conn.execute(_V2_BUCKET)          # predates calibration_status AND the band columns
+        conn.execute("INSERT INTO bucket(ts_start,local_start,pv_wh) VALUES(900,'x',1.0)")
+        conn.commit(); conn.close()
+        rec = _recorder(tmp)
+        rec._init_db()
+        rec._init_db()                    # idempotent
+        conn = sqlite3.connect(tmp)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(bucket)")}
+        assert {"calibration_status", "pv_forecast_p10_wh", "pv_forecast_p90_wh"} <= cols
+        row = conn.execute("SELECT pv_wh, pv_forecast_p10_wh FROM bucket WHERE ts_start=900").fetchone()
+        assert row == (1.0, None)         # old rows keep their data; the new columns are NULL
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert "pv_forecast_snapshot" in tables
+        conn.close()
+    # ...and a full-width pre-v4 table (today's schema minus the band columns) accepts a
+    # bucket carrying them once migrated
+    with tempfile.TemporaryDirectory() as d:
+        tmp = os.path.join(d, "history.db")
+        conn = sqlite3.connect(tmp)
+        conn.execute(_pre_v4_bucket_ddl()); conn.commit(); conn.close()
+        rec = _recorder(tmp)
+        rec._init_db()
+        a = BucketAccumulator(ts_start=900)
+        a.add(Sample(pv_forecast_w=1000, pv_forecast_p10_w=400, pv_forecast_p90_w=1600), 0.0)
+        a.add(Sample(pv_forecast_w=1000, pv_forecast_p10_w=400, pv_forecast_p90_w=1600), 900.0)
+        rec._write_bucket(a.bucket_row(1), a.battery_rows())
+        got = sqlite3.connect(tmp).execute(
+            "SELECT pv_forecast_wh, pv_forecast_p10_wh, pv_forecast_p90_wh FROM bucket").fetchone()
+        assert got == (250.0, 100.0, 400.0)
+
+
+# -- snapshot row builder -----------------------------------------------------
+
+def test_snapshot_rows_convert_kw_to_wh_and_keep_the_whole_band():
+    taken = _iso("2026-09-29T13:15:00+02:00")
+    periods = [
+        _period("2026-09-30T11:00:00+02:00", 2.0, 0.8, 3.2),     # 30-min period: kW x 0.5 h
+        _period("2026-09-30T11:30:00+02:00", 4.0, 1.0, 5.0),
+    ]
+    rows = forecast_snapshot_rows(periods, taken)
+    assert [r["period_ts"] for r in rows] == [_iso("2026-09-30T11:00:00+02:00"),
+                                              _iso("2026-09-30T11:30:00+02:00")]
+    r = rows[0]
+    assert (r["p50_wh"], r["p10_wh"], r["p90_wh"]) == (1000.0, 400.0, 1600.0)
+    assert r["taken_ts"] == taken
+    assert r["lead_h"] == round((_iso("2026-09-30T11:00:00+02:00") - taken) / 3600, 4)
+    assert rows[1]["p50_wh"] == 2000.0
+
+
+def test_snapshot_rows_store_a_missing_band_as_null_and_drop_periods_without_a_p50():
+    taken = _iso("2026-09-29T13:15:00+02:00")
+    periods = [
+        _period("2026-09-30T11:00:00+02:00", 2.0),               # no p10/p90
+        _period("2026-09-30T11:30:00+02:00", None, 1.0, 5.0),    # no p50 -> unusable
+        _period("2026-09-30T12:00:00+02:00", 1.0, 0.5, 1.5),
+    ]
+    rows = forecast_snapshot_rows(periods, taken)
+    assert len(rows) == 2
+    assert rows[0]["p10_wh"] is None and rows[0]["p90_wh"] is None
+    assert rows[1]["p50_wh"] == 500.0
+
+
+def test_snapshot_keeps_only_periods_that_have_not_ended():
+    # The same-day sensor also lists this morning; that is hindsight, not a forecast.
+    taken = _iso("2026-09-29T13:15:00+02:00")
+    periods = [_period(f"2026-09-29T{hh:02d}:{mm:02d}:00+02:00", 1.0, 0.5, 1.5)
+               for hh in (12, 13, 14) for mm in (0, 30)]
+    rows = forecast_snapshot_rows(periods, taken)
+    # 12:00 and 12:30 have ended; 13:00 is still running (ends 13:30 > 13:15)
+    starts = [r["period_ts"] for r in rows]
+    assert starts == [_iso("2026-09-29T13:00:00+02:00"), _iso("2026-09-29T13:30:00+02:00"),
+                      _iso("2026-09-29T14:00:00+02:00"), _iso("2026-09-29T14:30:00+02:00")]
+    assert rows[0]["lead_h"] == round(-15 / 60, 4)              # the running period leads negative
+
+
+def test_snapshot_lead_is_exact_across_midnight():
+    taken = _iso("2026-09-29T21:00:00+02:00")
+    rows = forecast_snapshot_rows([
+        _period("2026-09-29T23:30:00+02:00", 0.0, 0.0, 0.0),
+        _period("2026-09-30T00:00:00+02:00", 0.0, 0.0, 0.0),
+        _period("2026-09-30T12:00:00+02:00", 3.0, 1.0, 4.0),
+    ], taken)
+    assert [r["lead_h"] for r in rows] == [2.5, 3.0, 15.0]
+
+
+def test_snapshot_lead_is_exact_across_both_dst_changes():
+    tz_before = os.environ.get("TZ")
+    os.environ["TZ"] = "Europe/Berlin"
+    time.tzset()
+    try:
+        # autumn: 25 Oct 2026, 03:00 CEST -> 02:00 CET, so 02:30 happens twice
+        taken = _iso("2026-10-24T21:00:00+02:00")
+        rows = forecast_snapshot_rows([
+            _period("2026-10-25T02:30:00+02:00", 1.0, 0.5, 1.5),    # first 02:30
+            _period("2026-10-25T02:30:00+01:00", 1.0, 0.5, 1.5),    # second 02:30, an hour later
+            _period("2026-10-25T03:00:00+01:00", 1.0, 0.5, 1.5),
+        ], taken)
+        assert [r["lead_h"] for r in rows] == [5.5, 6.5, 7.0]
+        assert len({r["period_ts"] for r in rows}) == 3            # distinct keys despite equal local text
+        assert rows[0]["taken_local"] == "2026-10-24T21:00:00"     # local labels are wall-clock
+
+        # spring: 28 Mar 2027, 02:00 CET -> 03:00 CEST; 02:xx never exists
+        taken = _iso("2027-03-27T21:00:00+01:00")
+        rows = forecast_snapshot_rows([
+            _period("2027-03-28T01:30:00+01:00", 1.0, 0.5, 1.5),
+            _period("2027-03-28T03:00:00+02:00", 1.0, 0.5, 1.5),    # the 30-min step after 01:30
+        ], taken)
+        assert [r["lead_h"] for r in rows] == [4.5, 5.0]
+    finally:
+        if tz_before is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = tz_before
+        time.tzset()
+
+
+def test_snapshot_energy_follows_the_list_spacing():
+    taken = _iso("2026-09-29T13:15:00+02:00")
+    hourly = [_period("2026-09-30T11:00:00+02:00", 2.0, 1.0, 3.0),
+              _period("2026-09-30T12:00:00+02:00", 2.0, 1.0, 3.0)]
+    assert forecast_snapshot_rows(hourly, taken)[0]["p50_wh"] == 2000.0     # 2 kW x 1 h
+    single = [_period("2026-09-30T11:00:00+02:00", 2.0, 1.0, 3.0)]
+    assert forecast_snapshot_rows(single, taken)[0]["p50_wh"] == 1000.0     # defaults to 30 min
+    # a missing period must not stretch its neighbour's energy
+    gappy = [_period("2026-09-30T11:00:00+02:00", 2.0), _period("2026-09-30T11:30:00+02:00", 2.0),
+             _period("2026-09-30T13:00:00+02:00", 2.0)]
+    assert [r["p50_wh"] for r in forecast_snapshot_rows(gappy, taken)] == [1000.0] * 3
+
+
+def test_snapshot_rows_tolerate_junk_and_unsorted_input():
+    taken = _iso("2026-09-29T13:15:00+02:00")
+    for junk in (None, "x", 5, [], [None, "y", {"period_start": "nope", "pv_estimate": 1.0}]):
+        assert forecast_snapshot_rows(junk, taken) == []
+    shuffled = [_period("2026-09-30T12:00:00+02:00", 1.0), _period("2026-09-30T11:00:00+02:00", 1.0)]
+    rows = forecast_snapshot_rows(shuffled, taken)
+    assert [r["period_ts"] for r in rows] == sorted(r["period_ts"] for r in rows)
+
+
+def test_parse_snapshot_times_skips_malformed_entries():
+    assert parse_snapshot_times(("21:00", "13:15")) == [(13, 15), (21, 0)]
+    assert parse_snapshot_times(("13:15", "13:15", " 7:05 ")) == [(7, 5), (13, 15)]
+    assert parse_snapshot_times(("25:00", "12:99", "noon", "", "13")) == []
+    assert parse_snapshot_times(None) == []
+
+
+def test_latest_due_snapshot_finds_the_last_scheduled_instant():
+    times = [(13, 15), (21, 0)]
+    day = datetime(2026, 9, 29)
+    assert latest_due_snapshot(day.replace(hour=14), times) == day.replace(hour=13, minute=15)
+    assert latest_due_snapshot(day.replace(hour=21, minute=0), times) == day.replace(hour=21)
+    assert latest_due_snapshot(day.replace(hour=23, minute=59), times) == day.replace(hour=21)
+    # early morning: the last one was yesterday evening
+    assert latest_due_snapshot(day.replace(hour=3), times) == (day - timedelta(days=1)).replace(hour=21)
+    assert latest_due_snapshot(day.replace(hour=14), []) is None
+
+
+# -- persistence + query -------------------------------------------------------
+
+def _snap_rows(taken_ts, starts, p50=1.0):
+    return forecast_snapshot_rows([_period(s, p50, p50 / 2, p50 * 2) for s in starts], taken_ts)
+
+
+def test_write_snapshot_is_idempotent_and_queryable_by_target_period():
+    with tempfile.TemporaryDirectory() as d:
+        rec = _recorder(os.path.join(d, "history.db"))
+        rec._init_db()
+        starts = ["2026-09-30T11:00:00+02:00", "2026-09-30T11:30:00+02:00"]
+        day_ahead = _snap_rows(_iso("2026-09-29T13:15:00+02:00"), starts, 1.0)
+        evening = _snap_rows(_iso("2026-09-29T21:00:00+02:00"), starts, 2.0)
+        rec._write_snapshot(day_ahead)
+        rec._write_snapshot(day_ahead)               # same snapshot again: no duplicates
+        rec._write_snapshot(evening)
+        rows = rec.query_range(_iso("2026-09-30T00:00:00+02:00"), _iso("2026-09-30T23:59:00+02:00"),
+                               table="pv_forecast_snapshot")
+        assert len(rows) == 4
+        # one target period, two vintages, ordered by period then by when it was taken
+        assert [(r["period_ts"], r["taken_ts"]) for r in rows] == sorted(
+            (r["period_ts"], r["taken_ts"]) for r in rows)
+        first = rows[0]
+        assert first["p50_wh"] == 500.0 and first["p10_wh"] == 250.0 and first["p90_wh"] == 1000.0
+        assert rows[1]["p50_wh"] == 1000.0           # the evening vintage of the same period
+        assert rows[1]["lead_h"] < rows[0]["lead_h"]
+
+
+def test_snapshot_query_window_selects_by_target_period():
+    with tempfile.TemporaryDirectory() as d:
+        rec = _recorder(os.path.join(d, "history.db"))
+        rec._init_db()
+        rec._write_snapshot(_snap_rows(_iso("2026-09-29T13:15:00+02:00"),
+                                       ["2026-09-29T14:00:00+02:00", "2026-09-30T14:00:00+02:00"]))
+        rows = rec.query_range(_iso("2026-09-29T00:00:00+02:00"), _iso("2026-09-29T23:59:00+02:00"),
+                               table="pv_forecast_snapshot")
+        assert len(rows) == 1 and rows[0]["period_ts"] == _iso("2026-09-29T14:00:00+02:00")
+
+
+def test_snapshot_retention_purges_old_periods_only_when_configured():
+    with tempfile.TemporaryDirectory() as d:
+        rec = _recorder(os.path.join(d, "history.db"))
+        rec._init_db()
+        rec._write_snapshot(_snap_rows(1000, ["1970-01-01T00:30:00+00:00"]))   # ancient
+        assert len(rec.query_range(0, 10**9, table="pv_forecast_snapshot")) == 1   # retention off
+        rec._retention_days = 1
+        rec._write_snapshot(_snap_rows(int(time.time()), [
+            (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()]))
+        rows = rec.query_range(0, 10**11, table="pv_forecast_snapshot")
+        assert len(rows) == 1 and rows[0]["period_ts"] > 10**9
+
+
+# -- the recorder's snapshot job (fake hass) ------------------------------------
+
+class _FakeHass:
+    """Just enough of hass for the snapshot job: states + the executor hop."""
+
+    def __init__(self, states):
+        self._states = states
+        self.states = SimpleNamespace(get=self._states.get)
+
+    async def async_add_executor_job(self, fn, *args):
+        return fn(*args)
+
+
+def _state(periods):
+    return SimpleNamespace(state="16.0", attributes={"detailedForecast": periods})
+
+
+def _snapshot_recorder(tmp, states, options=None):
+    entry = SimpleNamespace(
+        options={"history_db_path": tmp, "history_retention_days": 0,
+                 "solcast_forecast_sensor": TODAY_ENTITY, **(options or {})},
+        data={}, entry_id="e1", title="Wattsmith",
+    )
+    rec = HistoryRecorder(_FakeHass(states), entry)
+    rec._init_db()
+    return rec
+
+
+def test_snapshot_job_copies_rest_of_today_and_all_of_tomorrow():
+    NOW = _iso("2026-09-29T13:15:00+02:00")
+    today = [_period(f"2026-09-29T{hh:02d}:{mm:02d}:00+02:00", 1.0, 0.5, 1.5)
+             for hh in range(6, 20) for mm in (0, 30)]
+    tomorrow = [_period(f"2026-09-30T{hh:02d}:{mm:02d}:00+02:00", 2.0, 1.0, 3.0)
+                for hh in range(0, 24) for mm in (0, 30)]
+    with tempfile.TemporaryDirectory() as d:
+        rec = _snapshot_recorder(os.path.join(d, "history.db"),
+                                 {TODAY_ENTITY: _state(today), TOMORROW_ENTITY: _state(tomorrow)})
+        with patch.object(h.time, "time", return_value=NOW):
+            written = asyncio.run(rec.async_snapshot_forecast())
+        rows = rec.query_range(0, 10**11, table="pv_forecast_snapshot")
+        assert written == len(rows)
+        assert len(rows) == 14 + 48         # today 13:00..19:30 = 14 periods, tomorrow = 48
+        assert all(r["taken_ts"] == NOW for r in rows)
+        assert min(r["lead_h"] for r in rows) == round(-15 / 60, 4)
+
+
+def test_snapshot_job_does_nothing_without_a_solcast_sensor_or_data():
+    with tempfile.TemporaryDirectory() as d:
+        rec = _snapshot_recorder(os.path.join(d, "history.db"), {}, {"solcast_forecast_sensor": ""})
+        assert asyncio.run(rec.async_snapshot_forecast()) == 0            # not configured
+        rec = _snapshot_recorder(os.path.join(d, "history.db"), {TODAY_ENTITY: None})
+        assert asyncio.run(rec.async_snapshot_forecast()) == 0            # sensor unavailable
+        assert rec.query_range(0, 10**11, table="pv_forecast_snapshot") == []
+
+
+def test_catchup_takes_a_missed_snapshot_once_and_not_when_already_taken():
+    tomorrow = [_period((datetime.now(timezone.utc) + timedelta(hours=h)).isoformat(), 1.0, 0.5, 1.5)
+                for h in range(1, 5)]
+    with tempfile.TemporaryDirectory() as d:
+        rec = _snapshot_recorder(os.path.join(d, "history.db"),
+                                 {TODAY_ENTITY: _state([]), TOMORROW_ENTITY: _state(tomorrow)})
+        rec._snapshot_times = [(0, 0)]          # 00:00 today has always already passed
+        taken = []                               # spy: two takes inside one second would merge
+        real = rec.async_snapshot_forecast       # into the same rows, so count the calls instead
+
+        async def spy():
+            taken.append(1)
+            return await real()
+        rec.async_snapshot_forecast = spy
+        asyncio.run(rec._catchup_cb(None))       # nothing recorded since -> take it now
+        assert len(taken) == 1
+        assert len(rec.query_range(0, 10**11, table="pv_forecast_snapshot")) == 4
+        asyncio.run(rec._catchup_cb(None))       # already have one after the due time -> skip
+        assert len(taken) == 1
+
+
+def test_snapshot_schedule_is_registered_at_start_and_released_at_stop():
+    with tempfile.TemporaryDirectory() as d:
+        rec = _snapshot_recorder(os.path.join(d, "history.db"), {})
+        rec.async_on_config_change = lambda source="": asyncio.sleep(0)
+        h.async_track_time_change.reset_mock()
+        h.async_call_later.reset_mock()
+        asyncio.run(rec.async_start())
+        assert h.async_track_time_change.call_count == 2                 # 13:15 and 21:00
+        hours = sorted((c.kwargs["hour"], c.kwargs["minute"])
+                       for c in h.async_track_time_change.call_args_list)
+        assert hours == [(13, 15), (21, 0)]
+        assert h.async_call_later.call_count == 1                        # the restart catch-up
+        assert len(rec._unsub_snapshots) == 3
+        asyncio.run(rec.async_stop())
+        assert rec._unsub_snapshots == []
+
+
+def test_snapshot_table_is_registered_for_query_history():
+    assert "pv_forecast_snapshot" in QUERY_TABLES
+    assert h._QUERY_TS_COLUMN["pv_forecast_snapshot"] == "period_ts"
+
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

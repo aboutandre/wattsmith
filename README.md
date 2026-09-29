@@ -34,7 +34,10 @@ Wattsmith owns all the decisions.
 - **History DB** — a dedicated, never-purged SQLite log of 15-minute energy
   buckets (PV, house, EV, grid, per-battery charge/discharge/SOC, prices) plus
   full **config versioning**, at `config/wattsmith/history.db`, for offline
-  pattern analysis and to correlate config changes to their effects.
+  pattern analysis and to correlate config changes to their effects. It also
+  records what Solcast forecast — P50/P10/P90 per bucket, and a twice-daily
+  snapshot of the whole day-ahead forecast (`pv_forecast_snapshot`) — so the
+  forecast's real accuracy can be measured.
 
 ## Architecture
 
@@ -257,7 +260,7 @@ python3 tests/test_binary_sensor.py    #  5 tests
 python3 tests/test_battery_bridge.py   # 22 tests  (HA-boundary; mocked registry)
 python3 tests/test_ev_coordinator.py   # 13 tests  (tick orchestration; faked driver/hass)
 python3 tests/test_manager_tick.py     # 10 tests  (tick orchestration; faked bridge/hass)
-python3 tests/test_history_db.py       # 12 tests  (pure helpers + real SQLite round-trip)
+python3 tests/test_history_db.py       # 53 tests  (pure helpers + real SQLite round-trip)
 python3 tests/test_economics.py        #  8 tests  (wear, effective cost, η estimator)
 python3 tests/test_arbitrage.py        # 12 tests  (forward sim + merit-order + bucket builder)
 # Total: 220 tests

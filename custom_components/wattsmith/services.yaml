@@ -19,7 +19,11 @@ query_history:
         datetime:
     table:
       name: Table
-      description: Which table to read from.
+      description: >-
+        Which table to read from. The range applies to each table's timestamp:
+        bucket start, event time, or — for pv_forecast_snapshot — the forecast's
+        TARGET period, so one window returns every Solcast forecast made for
+        those days (day-ahead and same-day) next to the bucket actuals.
       required: false
       default: bucket
       selector:
@@ -27,8 +31,11 @@ query_history:
           options:
             - bucket
             - battery_bucket
+            - battery_health
             - config_snapshot
             - config_event
+            - calibration_event
+            - pv_forecast_snapshot
     battery_id:
       name: Battery ID
       description: Only for the battery_bucket table — filter to a single battery.
