@@ -222,6 +222,9 @@ class ArbitrageSensor(CoordinatorEntity, SensorEntity):
         if self._key == "calibration_status":
             return {
                 "reason": data.get("calibration_reason"),
+                # the planned grid top-up as data: windows [{start, end}], energy_kwh,
+                # price_ct (average of the bought slots) and its min/max
+                **(data.get("calibration_summary") or {}),
                 # per battery (last 4 of id): days since full, kWh discharged since,
                 # predicted SOC under-reading and the learned drift rate
                 "batteries": data.get("calibration_batteries"),
@@ -253,6 +256,9 @@ class ArbitrageSensor(CoordinatorEntity, SensorEntity):
             "target_soc": data.get("target_soc"),
             "horizon_buckets": data.get("horizon_buckets"),
             "pv_forecast_until": data.get("pv_forecast_until"),
+            # the planned purchase as data: windows [{start, end}], energy_kwh, price_ct
+            # (average of the bought slots) and its min/max
+            **(data.get("plan_summary") or {}),
         }
 
 

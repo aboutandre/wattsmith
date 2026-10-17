@@ -307,10 +307,17 @@ class ArbitragePlan:
     # the horizon: sum of wh * (need price - effective buy cost) / 1000, in ct.
     # Lets two plans for the same forecast be compared (see plan_with_soft_cap).
     saving_ct: float = 0.0
+    # For plan_text, which words the plan for a person (`reason` stays the machine
+    # wording the history DB stores). Buckets are 15 min, bucket 0 = the one holding now.
+    kind: str = ""              # idle | no_deficit | no_window | waiting | charging
+    buy_slots: tuple[int, ...] = ()           # every bucket the plan buys in, now included
+    buy_slot_wh: tuple[float, ...] = ()
+    buy_slot_prices_ct: tuple[float, ...] = ()
+    breakeven_ct: float | None = None         # no_window: a shortfall must cost more to repay a buy
 
 
 def _idle(bat: BatteryModel, reason: str) -> ArbitragePlan:
-    return ArbitragePlan(0.0, bat.soc_pct, bat.min_soc, 0.0, reason)
+    return ArbitragePlan(0.0, bat.soc_pct, bat.min_soc, 0.0, reason, kind="idle")
 
 
 def _forward_sim(
@@ -497,7 +504,7 @@ def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> Arbi
         # Nothing to buy, but the stored energy is still earmarked: a load above
         # forecast now must not eat what a dearer bucket later is counting on.
         return ArbitragePlan(0.0, bat.soc_pct, _hold_floor(buckets, bat, econ, alloc, worth, 0.0),
-                             0.0, "no deficit in the forecast horizon")
+                             0.0, "no deficit in the forecast horizon", kind="no_deficit")
 
     # 2. Merit order: cover the dearest need first, each from the cheapest moment
     #    that can actually serve it. The alternative to pre-buying is buying AT the
@@ -541,15 +548,20 @@ def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> Arbi
                                                     econ.min_margin_ct))   # raw, unpadded
     if not matched:
         cheapest = min((b.price_ct for b in buckets), default=charge_price)
+        breakeven = effective_cost_ct(cheapest, econ.eta, econ.wear_ct) + econ.min_margin_ct
         return ArbitragePlan(
             0.0, bat.soc_pct, hold_floor_soc, profitable_wh,
-            f"no profitable window (no buy price beats the need; "
-            f"need > {effective_cost_ct(cheapest, econ.eta, econ.wear_ct) + econ.min_margin_ct:.1f} ct)",
+            f"no profitable window (no buy price beats the need; need > {breakeven:.1f} ct)",
+            kind="no_window", breakeven_ct=breakeven,
         )
 
     grid_now = min(purchases[0], headroom_now)
     target_soc = bat.soc_pct + grid_now / bat.wh_per_pct
-    common = dict(next_need_idx=first_need, next_need_price_ct=need_price, saving_ct=saving_ct)
+    buy_slots = tuple(j for j, wh in enumerate(purchases) if wh > 1.0)
+    common = dict(next_need_idx=first_need, next_need_price_ct=need_price, saving_ct=saving_ct,
+                  buy_slots=buy_slots,
+                  buy_slot_wh=tuple(purchases[j] for j in buy_slots),
+                  buy_slot_prices_ct=tuple(buckets[j].price_ct for j in buy_slots))
     if grid_now < 1.0:
         buy_j = min((j for _i, _p, j, _pb, _w in matched), default=None)
         return ArbitragePlan(
@@ -558,13 +570,13 @@ def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> Arbi
             f"cheapest buy is bucket {buy_j} @ {buckets[buy_j].price_ct:.1f} ct — waiting"
             if buy_j else f"already hold enough ({usable_now:.0f} Wh)",
             buy_idx=buy_j, buy_price_ct=buckets[buy_j].price_ct if buy_j is not None else None,
-            **common,
+            kind="waiting", **common,
         )
     return ArbitragePlan(
         grid_now, target_soc, hold_floor_soc, profitable_wh,
         f"grid-charge {grid_now:.0f} Wh @ {charge_price:.1f} ct (eff {eff_now:.1f}) "
         f"for {profitable_wh:.0f} Wh needed from bucket {first_need} @ {need_price:.1f} ct",
-        buy_idx=0, buy_price_ct=charge_price, **common,
+        buy_idx=0, buy_price_ct=charge_price, kind="charging", **common,
     )
 
 

@@ -347,7 +347,20 @@ class CalibrationPlan:
     open_ceiling: bool        # let PV charge the fleet to 100%
     grid_charge_now: bool     # buy from the grid this bucket to finish the job
     due_ids: tuple[str, ...]
-    reason: str
+    reason: str               # machine wording (history DB); plan_text.calibration_text is the human one
+    # Structured detail, for plan_text. Buckets are 15 min, bucket 0 = the one holding now.
+    detail: str = ""          # due: grid_off | not_overdue | no_prices; grid_charging: start | margin | pays
+    worst_pts: float | None = None      # predicted drift of the worst battery in play
+    worst_days: float | None = None     # ...and days since it was last full
+    limit_pts: float | None = None      # drift at which a calibration becomes due
+    grid_from_pts: float | None = None  # drift at which it may top up from the grid
+    max_days: float | None = None       # days after which it is due regardless
+    slots: tuple[int, ...] = ()         # buckets the grid top-up buys in (an estimate once running)
+    slot_prices_ct: tuple[float, ...] = ()
+    energy_wh: float = 0.0              # grid energy the top-up is sized for
+    later_idx: int | None = None        # the cheaper window a running top-up is not waiting for
+    later_gain_ct: float | None = None  # ...how much cheaper it is
+    dearest_between_ct: float | None = None  # ...and the dearest price before it
 
 
 def plan_calibration(
@@ -414,37 +427,61 @@ def plan_calibration(
             due.append(bid)
             if days(d) >= max_days or (pts is not None and pts >= threshold_pts + grid_extra_pts):
                 overdue.append(bid)
+    limits = dict(limit_pts=threshold_pts, grid_from_pts=threshold_pts + grid_extra_pts,
+                  max_days=max_days)
+
+    def worst_of(ids: list[str]) -> dict:
+        """The battery in `ids` furthest from a full charge (drift first, then days)."""
+        w = max(ids, key=lambda b: (drift[b].predicted_pts or 0.0, days(drift[b])))
+        return dict(worst_pts=drift[w].predicted_pts, worst_days=days(drift[w]), **limits)
+
     if not due:
         worst = max(drift.values(), key=lambda d: d.predicted_pts or 0.0, default=None)
         reason = (f"ok — worst predicted drift {worst.predicted_pts:.1f} pts"
                   if worst is not None and worst.predicted_pts is not None else "ok")
-        return CalibrationPlan("ok", False, False, (), reason)
+        return CalibrationPlan("ok", False, False, (), reason,
+                               worst_pts=worst.predicted_pts if worst is not None else None, **limits)
 
     ids = tuple(due)
     if not (grid_enabled and overdue and prices_ct and per_bucket_wh > 0):
+        detail = "grid_off" if not grid_enabled else "not_overdue" if not overdue else "no_prices"
         return CalibrationPlan("due", True, False, ids,
-                               f"due ({', '.join(i[-4:] for i in ids)}) — charge ceiling opened to 100% for PV")
+                               f"due ({', '.join(i[-4:] for i in ids)}) — charge ceiling opened to 100% for PV",
+                               detail=detail, **worst_of(due))
     window = prices_ct[:lookahead]
     n = max(1, math.ceil(need_wh / per_bucket_wh)) + 1   # +1: the house draws meanwhile
     chosen = sorted(range(len(window)), key=lambda i: (window[i], i))[:n]
+    info = dict(energy_wh=need_wh, **worst_of(overdue))
     if 0 in chosen:
+        slots = tuple(sorted(chosen))
         return CalibrationPlan("grid_charging", True, True, ids,
                                f"overdue — topping up from the grid @ {window[0]:.1f} ct "
-                               f"(cheapest {n} buckets)")
+                               f"(cheapest {n} buckets)",
+                               detail="start", slots=slots,
+                               slot_prices_ct=tuple(window[i] for i in slots), **info)
     first = min(chosen)
     if in_progress:
         now_ct = window[0]
         later_ct = min(window[i] for i in chosen)
         delivered_ct = now_ct / eta + wear_ct if eta > 0 else float("inf")
         dearest_between = max(window[1:first], default=0.0)
+        # a running top-up buys until full: this many buckets from now, back to back
+        running = tuple(range(min(len(window), max(1, math.ceil(need_wh / per_bucket_wh)))))
+        running_info = dict(slots=running, slot_prices_ct=tuple(window[i] for i in running),
+                            later_idx=first, **info)
         if now_ct - later_ct <= commit_margin_ct:
             return CalibrationPlan("grid_charging", True, True, ids,
                                    f"overdue — finishing the top-up @ {now_ct:.1f} ct "
-                                   f"(bucket {first} is only {now_ct - later_ct:.1f} ct cheaper)")
+                                   f"(bucket {first} is only {now_ct - later_ct:.1f} ct cheaper)",
+                                   detail="margin", later_gain_ct=now_ct - later_ct, **running_info)
         if dearest_between >= delivered_ct:
             return CalibrationPlan("grid_charging", True, True, ids,
                                    f"overdue — finishing the top-up @ {now_ct:.1f} ct "
                                    f"(it pays before bucket {first}: up to {dearest_between:.1f} ct "
-                                   f"vs {delivered_ct:.1f} ct delivered)")
+                                   f"vs {delivered_ct:.1f} ct delivered)",
+                                   detail="pays", dearest_between_ct=dearest_between, **running_info)
+    slots = tuple(sorted(chosen))
     return CalibrationPlan("grid_waiting", True, False, ids,
-                           f"overdue — grid top-up waits for bucket {first} @ {window[first]:.1f} ct")
+                           f"overdue — grid top-up waits for bucket {first} @ {window[first]:.1f} ct",
+                           detail="waiting", slots=slots,
+                           slot_prices_ct=tuple(window[i] for i in slots), **info)

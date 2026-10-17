@@ -38,6 +38,7 @@ from .arbitrage import (
 )
 from .battery_bridge import BatteryBridge
 from .load_profile import LoadProfile, day_forecast, fit_load_profile
+from .plan_text import Ctx, arbitrage_text, calibration_text, clip, locale_for, plan_summary
 from .const import (
     CONF_ADAPTIVE_CEILING_SOC,
     CONF_ARBITRAGE_ENABLED,
@@ -360,20 +361,28 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         if profile is not None:
             self._load_profile = profile
 
+    def _text_ctx(self, now: float) -> Ctx:
+        """Clock + number format for wording a plan: bucket 0 starts where build_buckets' does."""
+        cfg = self.hass.config
+        return Ctx(
+            base_ts=int(now // 900) * 900, now_ts=now,
+            local=lambda ts: dt_util.as_local(dt_util.utc_from_timestamp(ts)),
+            loc=locale_for(getattr(cfg, "country", None), getattr(cfg, "language", None)),
+        )
+
     async def _async_calibration(self, bat: BatteryModel, buckets, eta: float,
-                                 wear_ct: float = 0.0) -> dict[str, Any]:
+                                 wear_ct: float, now: float, ctx: Ctx) -> dict[str, Any]:
         """Predict each battery's SOC drift now and decide on a calibration charge."""
         opts = self.entry.options
         query = self._recorder_query()
         states = self.bridge.read_all()
-        import time
-        now = time.time()
         if query is None:
             # history DB not up yet (it starts after us) or disabled: we cannot know
             # when the batteries were last full, so decide nothing rather than guess
             self._calibration = None
             return {"calibration_status": "unknown",
-                    "calibration_reason": "history DB not available yet",
+                    "calibration_reason": "No calibration decision yet: history DB not available",
+                    "calibration_summary": plan_summary((), (), None, ctx),
                     "calibration_batteries": {}}
         rows = await query(int(now - DRIFT_STATE_DAYS * 86400), int(now),
                            table="battery_bucket", limit=DRIFT_STATE_DAYS * 96 * 16)
@@ -411,8 +420,16 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
                                         if d.predicted_pts is not None else None),
                 "drift_pts_per_kwh": round(fit.pts_per_kwh, 2) if fit else None,
             }
-        return {"calibration_status": self._calibration.status,
-                "calibration_reason": self._calibration.reason,
+        plan = self._calibration
+        try:
+            reason = clip(calibration_text(plan, ctx))
+            summary = plan_summary(plan.slots, plan.slot_prices_ct, plan.energy_wh, ctx)
+        except Exception as err:  # noqa: BLE001 - wording is display only, it must not cost the decision
+            _LOGGER.warning("arbitrage: calibration wording failed: %s", err)
+            reason, summary = plan.reason, {}
+        return {"calibration_status": plan.status,
+                "calibration_reason": reason,
+                "calibration_summary": summary,
                 "calibration_batteries": per_battery}
 
     def _wear_ct(self) -> float:
@@ -543,8 +560,10 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
             prices = await self._prices()
             pv = self._pv_by_slot()
             load_at, load_src = self._load_at()
+            now = time.time()
+            ctx = self._text_ctx(now)
             buckets = build_buckets(
-                time.time(), prices, pv, None,
+                now, prices, pv, None,
                 horizon_h=ARBITRAGE_HORIZON_H, load_at=load_at,
             )
             overhead_w, overhead_src = self._overhead()
@@ -561,16 +580,27 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
             )
             deficit = forecast_deficit_wh(buckets, bat)
             try:
-                calib = await self._async_calibration(bat, buckets, eta, wear)
+                calib = await self._async_calibration(bat, buckets, eta, wear, now, ctx)
             except Exception as err:  # noqa: BLE001 - calibration must never break arbitrage
                 _LOGGER.warning("arbitrage: calibration planning failed: %s", err)
                 self._calibration = None
-                calib = {"calibration_status": "error", "calibration_reason": str(err),
+                calib = {"calibration_status": "error",
+                         "calibration_reason": clip(f"Calibration planner error: {err}"),
+                         "calibration_summary": plan_summary((), (), None, ctx),
                          "calibration_batteries": {}}
+            # `plan.reason` stays the machine wording the history DB stores; the sensors get a sentence
+            try:
+                text = clip(arbitrage_text(plan, ctx, lift_gain if self._ceiling_lifted else None))
+                summary = plan_summary(plan.buy_slots, plan.buy_slot_prices_ct,
+                                       sum(plan.buy_slot_wh), ctx)
+            except Exception as err:  # noqa: BLE001 - wording is display only, it must not cost the plan
+                _LOGGER.warning("arbitrage: plan wording failed: %s", err)
+                text, summary = plan.reason, {}
             if self._calibration and self._calibration.grid_charge_now:
                 # finish the calibration from the grid: charge to 100% this bucket
                 plan = replace(plan, grid_charge_now_wh=bat.charge_power_w * 0.25, target_soc=100.0,
                                reason=f"calibration: {self._calibration.reason}")
+                text, summary = calib["calibration_reason"], calib["calibration_summary"]
             self._write_advisory(plan, eta, wear)
             return {
                 **calib,
@@ -580,7 +610,8 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
                 "target_soc": plan.target_soc,
                 "hold_floor_soc": plan.hold_floor_soc,
                 "profitable_deficit_wh": plan.profitable_deficit_wh,
-                "reason": plan.reason,
+                "reason": text,
+                "plan_summary": summary,
                 "eta": eta, "eta_source": eta_src, "wear_ct": wear,
                 "eta_override": self.eta_override, **self._eta_detail,
                 "delivery_factor": delivery, "delivery_source": delivery_src,

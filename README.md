@@ -60,6 +60,7 @@ in `tests/`:
 | `adaptive.py` | Adaptive PV ceiling gate (pure function, no HA) |
 | `economics.py` | Battery economics: wear cost, effective cost, EFC/SoH, self-measured η |
 | `arbitrage.py` | Forward 15-min sim + merit-order arbitrage decision (pure) |
+| `plan_text.py` | Words for the calibration and arbitrage plans: what, how much, when, price, why (pure) |
 | `history_db.py` | 15-min bucket logging + config versioning (executor/SQLite shell) |
 | `validate_config.py` | Cross-value config sanity checks (reserve↔cap clamp, phase thresholds, …) |
 | `wallbox.py` | Brand-agnostic wallbox contract: `WallboxDriver`, normalized state, drift reconcile |
