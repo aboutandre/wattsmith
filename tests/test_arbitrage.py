@@ -4,6 +4,7 @@ Run: python3 tests/test_arbitrage.py  |  pytest tests/test_arbitrage.py
 """
 import importlib.util
 import sys
+from dataclasses import replace
 
 import pytest
 from pathlib import Path
@@ -97,6 +98,43 @@ def test_buys_now_too_when_one_cheap_bucket_cannot_cover_the_need():
     plan = plan_arbitrage(buckets, BAT, ECON)
     assert plan.grid_charge_now_wh > 0
     assert plan.next_need_idx == 2 and plan.next_need_price_ct == 35
+
+
+_AT_FLOOR = BatteryModel(soc_pct=11.0, capacity_wh=15360.0, min_soc=11.0,
+                         max_soc=80.0, charge_power_w=7500.0)
+
+
+def test_a_hundredth_of_a_cent_cheaper_next_bucket_does_not_defer_the_purchase():
+    # hel-144, 2026-10-24: 13.81 ct now, 13.80 ct next, a 25 ct need behind them. The
+    # next bucket took the whole purchase, bucket 0 got a 4 Wh remainder and the fleet
+    # waited a quarter-hour (a re-plan later, for the same 0.01 ct) for nothing.
+    buckets = [Bucket(13.81, 0, 500), Bucket(13.80, 0, 500), Bucket(25, 0, 1200)]
+    plan = plan_arbitrage(buckets, _AT_FLOOR, ECON)
+    assert plan.buy_idx == 0, plan.reason
+    assert plan.grid_charge_now_wh > 1000
+
+    # the old order, for the record: strictly cheapest first
+    old = plan_arbitrage(buckets, _AT_FLOOR, replace(ECON, buy_now_tol_ct=0.0))
+    assert old.buy_idx == 1 and old.grid_charge_now_wh < 10
+
+
+def test_a_clearly_cheaper_next_bucket_still_defers_the_purchase():
+    # The head start is only for noise: 0.81 ct cheaper is a real saving, wait for it.
+    buckets = [Bucket(13.81, 0, 500), Bucket(13.00, 0, 500), Bucket(25, 0, 1200)]
+    plan = plan_arbitrage(buckets, _AT_FLOOR, ECON)
+    assert plan.grid_charge_now_wh == 0.0
+    assert plan.buy_idx == 1 and "waiting" in plan.reason
+
+
+def test_head_start_for_now_does_not_hide_a_later_bucket_that_passes_the_gate():
+    # 22.5 ct clears the gate at 13.80 ct (22.45) but not at 13.90 ct (22.58). The head
+    # start sorts the failing bucket 0 first; the search must go on to bucket 1, not
+    # stop and report "no profitable window".
+    buckets = [Bucket(13.90, 0, 500), Bucket(13.80, 0, 500), Bucket(22.5, 0, 1200)]
+    plan = plan_arbitrage(buckets, _AT_FLOOR, ECON)
+    assert plan.grid_charge_now_wh == 0.0
+    assert plan.buy_idx == 1 and "waiting" in plan.reason
+    assert "no profitable window" not in plan.reason
 
 
 def test_cheap_midday_trough_charges_for_the_night():

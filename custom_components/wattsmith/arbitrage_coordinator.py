@@ -32,6 +32,7 @@ from .arbitrage import (
     forecast_deficit_wh,
     plan_arbitrage,
     plan_with_soft_cap,
+    price_retry_delay_s,
     pv_slots_from_detailed,
     solcast_forecast_entities,
     with_discharge_overhead,
@@ -114,6 +115,8 @@ from .soc_drift import (
 _LOGGER = logging.getLogger(__name__)
 
 ARBITRAGE_TICK_S = 300.0  # 5 min — prices/forecast move on ~15-min timescales
+# ticks in a row without a priced bucket before the log escalates from info to warning
+PRICE_MISS_WARN_AFTER = 4
 
 
 class ArbitrageCoordinator(DataUpdateCoordinator):
@@ -143,6 +146,9 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         self._ceiling_lifted = False
         # house-load forecast from the history DB (hel-141); None until a week of data
         self._load_profile: LoadProfile | None = None
+        # ticks in a row with no priced bucket (hel-143), and why the last price fetch failed
+        self._price_misses = 0
+        self._price_problem: str | None = None
 
     # ---- public surface (read by the manager, gated by the switch) ------
     @property
@@ -465,6 +471,7 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
             )
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("arbitrage: get_prices failed: %s", err)
+            self._price_problem = f"tibber.get_prices failed: {err}"
             return []
         # in-process HA returns the service_response directly; be robust to a wrapper
         resp = (resp or {}).get("service_response", resp) or {}
@@ -481,7 +488,35 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
                     out.append((dt.timestamp(), float(price)))
                 except (ValueError, TypeError):
                     continue
+        self._price_problem = None if out else "tibber.get_prices returned no prices"
         return out
+
+    def _track_price_feed(self, buckets: list, prices: list) -> None:
+        """Retry sooner while a tick has no priced bucket to plan on (hel-143).
+
+        Right after a restart tibber.get_prices can fail or come back empty, and the
+        plan then reads "no forecast" and does nothing until the next tick. That tick
+        is 5 min away; retry on a short back-off instead (see price_retry_delay_s) and
+        go back to the normal interval once a tick has buckets. Prices that exist but do
+        not cover the current quarter-hour count the same.
+        """
+        if buckets:
+            if self._price_misses:
+                _LOGGER.info("arbitrage: priced buckets are back after %d empty tick(s)",
+                             self._price_misses)
+            self._price_misses = 0
+        else:
+            self._price_misses += 1
+            why = self._price_problem or (
+                "the published prices do not cover the current quarter-hour" if prices
+                else "no prices")
+            level = logging.WARNING if self._price_misses == PRICE_MISS_WARN_AFTER else (
+                logging.INFO if self._price_misses == 1 else logging.DEBUG)
+            _LOGGER.log(level, "arbitrage: no priced bucket to plan on (%s); %d tick(s) in a row, "
+                        "planning is idle until prices return", why, self._price_misses)
+        delay = timedelta(seconds=price_retry_delay_s(self._price_misses, ARBITRAGE_TICK_S))
+        if self.update_interval != delay:
+            self.update_interval = delay
 
     def _pv_by_slot(self) -> dict[int, float]:
         """PV forecast per 15-min slot across today AND tomorrow (hel-131)."""
@@ -547,6 +582,7 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
                 time.time(), prices, pv, None,
                 horizon_h=ARBITRAGE_HORIZON_H, load_at=load_at,
             )
+            self._track_price_feed(buckets, prices)
             overhead_w, overhead_src = self._overhead()
             buckets = with_discharge_overhead(buckets, overhead_w)
             # Max Charge SOC is a soft cap: plan at it, and lift it to the adaptive

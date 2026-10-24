@@ -128,6 +128,23 @@ def build_buckets(
     return buckets
 
 
+PRICE_RETRY_FIRST_S = 15.0
+
+
+def price_retry_delay_s(misses: int, normal_s: float) -> float:
+    """Seconds until the next arbitrage tick, given how many ticks in a row had no priced bucket.
+
+    The tariff feed can be missing for a while after a restart (the Tibber service is
+    not registered yet, or has no data), and the normal tick is minutes apart: a plan
+    that starts empty would sit idle for a whole interval (hel-143). So retry at 15 s
+    and back off by doubling (15, 30, 60, 120, 240 s), never beyond `normal_s`. Zero
+    misses is the normal interval.
+    """
+    if misses <= 0:
+        return normal_s
+    return min(normal_s, PRICE_RETRY_FIRST_S * 2.0 ** min(misses - 1, 16))
+
+
 def with_discharge_overhead(buckets: list[Bucket], overhead_w: float) -> list[Bucket]:
     """Add the energy the fleet sends to the GRID while it covers the house (hel-139).
 
@@ -288,6 +305,12 @@ class Econ:
     # forecast can miss (e.g. a below-baseline night), and "already hold enough" with
     # zero margin means a miss drains the fleet with no buffer left.
     forecast_margin_frac: float = 0.15
+    # Head start (ct/kWh) the current bucket gets in the cheapest-first purchase order.
+    # A later bucket that is cheaper by less than this does not pull the purchase away
+    # from now: such a gap is noise (the forecast margin is 15 %, the gate's margin
+    # 1.5 ct), while a purchase deferred by one bucket re-plans every tick and, bought
+    # at full power, needs a whole bucket to fit (hel-144).
+    buy_now_tol_ct: float = 0.25
 
 
 @dataclass(frozen=True)
@@ -507,12 +530,16 @@ def plan_arbitrage(buckets: list[Bucket], bat: BatteryModel, econ: Econ) -> Arbi
     matched: list[tuple[int, float, int, float, float]] = []  # need_i, p_need, buy_j, p_buy, wh
     for i, p_need, wh in sorted(deficits, key=lambda d: -d[1]):
         remaining = wh * pad
-        # cheapest-first; price-sorted means the first failure ends the search
-        for j in sorted(range(0, i), key=lambda k: buckets[k].price_ct):
+        # cheapest-first, the current bucket with its buy-now head start. Apart from
+        # bucket 0 the order is by price, so the first failure there ends the search.
+        for j in sorted(range(0, i),
+                        key=lambda k: buckets[k].price_ct - (econ.buy_now_tol_ct if k == 0 else 0.0)):
             if remaining <= 1.0:
                 break
             p_buy = buckets[j].price_ct
             if not is_profitable(p_need, p_buy, econ.eta, econ.wear_ct, econ.min_margin_ct):
+                if j == 0:
+                    continue   # its head start can put a dearer bucket 0 first; later ones may pass
                 break
             room_power = per_bucket_charge - purchases[j]
             # Buying at j lifts SOC for every bucket up to the deficit, so the

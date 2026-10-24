@@ -136,17 +136,30 @@ def test_delivery_factor_scales_every_soc_conversion():
 
 
 # ── 3. the 13:12 decision ─────────────────────────────────────────────────────
+#
+# Bucket 0 costs 14.24 ct and bucket 1 (the 14.1 ct one) is 0.14 ct cheaper. Since hel-144
+# that gap is inside the buy-now head start (Econ.buy_now_tol_ct, 0.25 ct), so the planner
+# buys in bucket 0 instead of waiting a quarter-hour; with the head start off it waits.
+_STRICT = a.Econ(eta=ETA, wear_ct=WEAR, min_margin_ct=1.5, forecast_margin_frac=0.15,
+                 buy_now_tol_ct=0.0)
+
+
 def test_at_1312_nominal_capacity_saw_almost_no_need():
     plan = a.plan_arbitrage(_buckets(), _fleet(R["soc_at_1312"], 1.0), ECON)
-    assert plan.grid_charge_now_wh == 0.0
+    assert plan.grid_charge_now_wh < 400.0, plan.reason       # a sliver, no more
     assert plan.next_need_idx is None or plan.profitable_deficit_wh < 400.0, plan.reason
+    strict = a.plan_arbitrage(_buckets(), _fleet(R["soc_at_1312"], 1.0), _STRICT)
+    assert strict.grid_charge_now_wh == 0.0                   # the sliver waited for bucket 1
 
 
-def test_at_1312_the_measured_fleet_sees_the_night_short_and_waits_for_1330():
+def test_at_1312_the_measured_fleet_sees_the_night_short_and_buys_in_the_cheap_window():
     plan = a.plan_arbitrage(_buckets(overhead_w=TRUE_EXPORT_W),
                             _fleet(R["soc_at_1312"], TRUE_DELIVERY), ECON)
     assert plan.next_need_idx is not None and plan.next_need_price_ct >= 30.0, plan.reason
-    assert plan.buy_idx == 1 and plan.buy_price_ct < 15.0, plan.reason   # 13:30 @ 14.1 ct
+    assert plan.buy_idx == 0 and plan.buy_price_ct < 15.0, plan.reason   # now, 14.24 ct
+    strict = a.plan_arbitrage(_buckets(overhead_w=TRUE_EXPORT_W),
+                              _fleet(R["soc_at_1312"], TRUE_DELIVERY), _STRICT)
+    assert strict.buy_idx == 1 and strict.buy_price_ct < 15.0, strict.reason   # 13:30 @ 14.1 ct
 
 
 # ── 4. rolling replay of the whole 24 h ───────────────────────────────────────
@@ -229,7 +242,7 @@ def test_at_80_percent_the_night_cannot_be_bought_for():
 def test_soft_cap_lifts_to_carry_14_ct_energy_into_the_night():
     plan, lifted, gain = _soft()
     assert lifted and gain >= 5.0, (gain, plan.reason)
-    assert plan.buy_idx == 1 and plan.buy_price_ct < 15.0, plan.reason
+    assert plan.buy_idx == 0 and plan.buy_price_ct < 15.0, plan.reason   # now, 14.24 ct (hel-144)
 
 
 def test_soft_cap_hysteresis():
