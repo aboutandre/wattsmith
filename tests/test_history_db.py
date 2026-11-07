@@ -126,6 +126,13 @@ def test_bucket_accumulator_energy_and_snapshots():
     assert brows[0]["soc_start"] == 50.0 and brows[0]["temp_c"] == 25.0
 
 
+def test_plausible_power_drops_corrupt_reads():
+    assert h.plausible_power(None) is None
+    assert h.plausible_power(-4200.0) == -4200.0
+    assert h.plausible_power(429_496_729_797.0) is None
+    assert h.plausible_power(-60_000.0) is None
+
+
 def test_bucket_forecast_null_when_absent():
     a = BucketAccumulator(ts_start=0)
     a.add(Sample(pv_w=100), 3600.0)

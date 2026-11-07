@@ -48,6 +48,7 @@ from .const import (
     CONF_TIBBER_SENSOR,
     CONF_WEATHER_SENSOR,
     DOMAIN,
+    MAX_PLAUSIBLE_POWER_W,
 )
 from .safety import SOURCE_ACK, SOURCE_READ
 from .settings import (
@@ -279,6 +280,17 @@ class BatteryAccum:
             self.soc_end = soc
         if temp is not None:
             self.temp_c = temp
+
+
+def plausible_power(w: float | None) -> float | None:
+    """`w`, or None for a corrupt read beyond MAX_PLAUSIBLE_POWER_W (hel-142).
+
+    One such read integrated for a minute is billions of Wh in its bucket, which
+    the load profile then carries for its whole 8-week window.
+    """
+    if w is None or abs(w) > MAX_PLAUSIBLE_POWER_W:
+        return None
+    return w
 
 
 @dataclass
@@ -591,10 +603,10 @@ class HistoryRecorder:
             sum(s * c for s, c in socs) / sum(c for _, c in socs) if socs else None
         )
         return Sample(
-            pv_w=self._num(o.get(CONF_PV_SENSOR)),
-            house_w=self._num(o.get(CONF_HOUSE_CONSUMPTION_SENSOR) or HOUSE_CONSUMPTION_SENSOR),
-            ev_w=self._ev_power(),
-            grid_w=self._num(o.get(CONF_GRID_SENSOR) or self.entry.data.get(CONF_GRID_SENSOR)),
+            pv_w=self._power(o.get(CONF_PV_SENSOR)),
+            house_w=self._power(o.get(CONF_HOUSE_CONSUMPTION_SENSOR) or HOUSE_CONSUMPTION_SENSOR),
+            ev_w=plausible_power(self._ev_power()),
+            grid_w=self._power(o.get(CONF_GRID_SENSOR) or self.entry.data.get(CONF_GRID_SENSOR)),
             pv_forecast_w=self._forecast_w(o.get(CONF_SOLCAST_FORECAST_SENSOR)),
             price_import=self._num(o.get(CONF_TIBBER_SENSOR)),
             price_export=float(o.get(CONF_EXPORT_PRICE, DEFAULT_EXPORT_PRICE)),
@@ -617,6 +629,10 @@ class HistoryRecorder:
             return float(st.state)
         except (ValueError, TypeError):
             return None
+
+    def _power(self, entity_id: str | None) -> float | None:
+        """A power sensor in W, or None when it is missing or implausible (hel-142)."""
+        return plausible_power(self._num(entity_id))
 
     def _attr_state(self, entity_id: str) -> str | None:
         st = self.hass.states.get(entity_id)

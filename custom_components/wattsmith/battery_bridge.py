@@ -31,6 +31,7 @@ from .const import (
     BASE_SENSOR_SOC,
     BASE_SVC_SET_MODE,
     BASE_SVC_SET_PASSIVE_MODE,
+    MAX_PLAUSIBLE_POWER_W,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -130,6 +131,10 @@ class BatteryBridge:
         for h in discover_batteries(self._hass):
             soc = self._read_float(h.soc_entity)
             power = self._read_float(h.power_entity)
+            if power is not None and abs(power) > MAX_PLAUSIBLE_POWER_W:
+                _LOGGER.warning("%s: ignoring implausible battery power %s W",
+                                h.power_entity, power)
+                power = None
             cap = self._read_float(h.capacity_entity)
             states.append(
                 BatteryState(
