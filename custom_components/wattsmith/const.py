@@ -105,7 +105,7 @@ CONF_CALIBRATION_GRID: Final = "calibration_grid"                    # allow a g
 CONF_PULSE_HOLD_ENABLED: Final = "pulse_hold_enabled"
 
 
-# Any power reading beyond this is a corrupt read, not a real flow (hel-142).
+# Any power reading beyond this is a corrupt read, not a real flow.
 # A Marstek once reported 429,496,729,797 W for one poll (an unsigned 32-bit
 # wrap): the house is fused far below 50 kW, so such a value is dropped as
 # "no reading" rather than integrated into the history DB and the forecast.

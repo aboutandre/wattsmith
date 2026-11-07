@@ -234,7 +234,7 @@ def test_read_all_happy_path():
 
 
 def test_read_all_drops_an_implausible_power_reading():
-    # hel-142: the base once reported 429,496,729,797 W for one poll.
+    # 2026-11-05: the base once reported 429,496,729,797 W for one poll.
     hass = _make_hass(
         _battery_ents("entry_a", "device_a"),
         {"sensor.entry_a_soc": "26.0", "sensor.entry_a_power": "429496729797"},

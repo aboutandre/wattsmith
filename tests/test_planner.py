@@ -416,7 +416,7 @@ if __name__ == "__main__":
     print(f"\n{len(tests)} planner tests passed ✓")
 
 
-# ---- the arbitrage discharge hold reaches the controller (hel-142) -------
+# ---- the arbitrage discharge hold reaches the controller -------
 # The manager hands the hold floor to the planner as BatteryReading.min_soc.
 # Until v0.17.1 the planner built the controller's batteries from its own
 # cfg.min_soc and silently dropped it: on 2026-09-28/29 the hold sat at the

@@ -407,7 +407,7 @@ def test_ev_right_of_way_still_caps_a_lifted_ceiling():
     assert mgr.planner.config.max_battery_soc == 60.0
 
 
-# ── the discharge hold reaches the battery commands (hel-142) ─────────────────
+# ── the discharge hold reaches the battery commands ─────────────────
 def test_arbitrage_hold_floor_stops_the_batteries_discharging():
     # the whole path: arbitrage coordinator -> manager -> planner -> controller.
     # Until v0.17.1 the planner dropped the floor, and this commanded ~110 W each

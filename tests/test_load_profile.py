@@ -85,7 +85,7 @@ def test_a_weekday_that_differs_is_learned_but_shrunk_toward_all_days():
 
 
 def test_a_corrupt_bucket_is_skipped_not_averaged_in():
-    # hel-142: one 429-GW Marstek poll left 7.2 GWh in a single bucket, and the
+    # 2026-11-05: one 429-GW Marstek poll left 7.2 GWh in a single bucket, and the
     # profile then forecast ~65 MWh per quarter hour around 18:00 on every day.
     rows = _rows(_flat_days("2026-09-01", 28))
     rows[20 * 96 + 73]["house_wh"] = 7_158_930_763.63

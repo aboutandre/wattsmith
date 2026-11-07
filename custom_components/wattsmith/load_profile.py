@@ -62,7 +62,7 @@ SLOTS_PER_WEEK = 7 * SLOTS_PER_DAY
 BUCKET_S = 900
 # Most energy a real 15-minute bucket can hold: 50 kW (const.MAX_PLAUSIBLE_POWER_W,
 # repeated here to keep this module pure) for a quarter hour. A bucket above it
-# was integrated from a corrupt read (hel-142: one 429-GW Marstek poll left
+# was integrated from a corrupt read (2026-11-05: one 429-GW Marstek poll left
 # 7.2 GWh in the 2026-11-05 18:15 bucket) and is skipped, not averaged in.
 MAX_PLAUSIBLE_BUCKET_WH = 50_000.0 * BUCKET_S / 3600.0
 

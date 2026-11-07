@@ -283,7 +283,7 @@ class BatteryAccum:
 
 
 def plausible_power(w: float | None) -> float | None:
-    """`w`, or None for a corrupt read beyond MAX_PLAUSIBLE_POWER_W (hel-142).
+    """`w`, or None for a corrupt read beyond MAX_PLAUSIBLE_POWER_W.
 
     One such read integrated for a minute is billions of Wh in its bucket, which
     the load profile then carries for its whole 8-week window.
@@ -631,7 +631,7 @@ class HistoryRecorder:
             return None
 
     def _power(self, entity_id: str | None) -> float | None:
-        """A power sensor in W, or None when it is missing or implausible (hel-142)."""
+        """A power sensor in W, or None when it is missing or implausible."""
         return plausible_power(self._num(entity_id))
 
     def _attr_state(self, entity_id: str) -> str | None:

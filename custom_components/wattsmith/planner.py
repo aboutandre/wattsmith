@@ -225,7 +225,7 @@ class DispatchPlanner:
                 # hours). Until v0.17.1 this used cfg.min_soc alone and silently
                 # dropped the hold: it was computed and shown but never reached the
                 # controller, so the fleet kept covering a 33 ct night and hit the
-                # 41 ct morning empty (2026-09-29, hel-142). Stall detection above
+                # 41 ct morning empty (2026-09-29, 2026-11-05). Stall detection above
                 # stays on cfg.min_soc: it looks for the HARDWARE floor, not the hold.
                 floor = max(cfg.min_soc, b.min_soc)
                 healthy.append(BatteryState(
