@@ -153,6 +153,12 @@ def with_discharge_overhead(buckets: list[Bucket], overhead_w: float) -> list[Bu
             for b in buckets]
 
 
+# Most energy a real 15-minute bucket can hold (50 kW, const.MAX_PLAUSIBLE_POWER_W,
+# for a quarter hour; mirrors load_profile.MAX_PLAUSIBLE_BUCKET_WH). Larger values
+# come from a corrupt read and are skipped.
+MAX_PLAUSIBLE_BUCKET_WH = 50_000.0 * BUCKET_H
+
+
 def fit_discharge_overhead_w(rows: list[dict], min_buckets: int = 96) -> float | None:
     """Mean grid export (W) while the fleet covers the house, from history-DB `bucket` rows.
 
@@ -164,7 +170,9 @@ def fit_discharge_overhead_w(rows: list[dict], min_buckets: int = 96) -> float |
     def g(r: dict, k: str) -> float:
         return float(r.get(k) or 0.0)
     sel = [r for r in rows
-           if g(r, "fleet_discharge_wh") > 20.0 and g(r, "fleet_charge_wh") < 5.0
+           if max(g(r, "house_wh"), g(r, "fleet_discharge_wh"), g(r, "grid_export_wh"))
+           <= MAX_PLAUSIBLE_BUCKET_WH          # skip buckets from a corrupt read
+           and g(r, "fleet_discharge_wh") > 20.0 and g(r, "fleet_charge_wh") < 5.0
            and g(r, "pv_wh") < g(r, "house_wh")]
     if len(sel) < min_buckets:
         return None

@@ -60,6 +60,11 @@ from datetime import datetime, timedelta
 SLOTS_PER_DAY = 96
 SLOTS_PER_WEEK = 7 * SLOTS_PER_DAY
 BUCKET_S = 900
+# Most energy a real 15-minute bucket can hold: 50 kW (const.MAX_PLAUSIBLE_POWER_W,
+# repeated here to keep this module pure) for a quarter hour. A bucket above it
+# was integrated from a corrupt read (2026-11-05: one 429-GW Marstek poll left
+# 7.2 GWh in the 2026-11-05 18:15 bucket) and is skipped, not averaged in.
+MAX_PLAUSIBLE_BUCKET_WH = 50_000.0 * BUCKET_S / 3600.0
 
 
 @dataclass(frozen=True)
@@ -106,6 +111,8 @@ def fit_load_profile(
     for r in rows:
         wh, local = r.get("house_wh"), r.get("local_start")
         if wh is None or not local or now_ts - r["ts_start"] > window_days * 86400:
+            continue
+        if not 0.0 <= float(wh) <= MAX_PLAUSIBLE_BUCKET_WH:
             continue
         stamp = datetime.fromisoformat(local[:19])
         day = local[:10]

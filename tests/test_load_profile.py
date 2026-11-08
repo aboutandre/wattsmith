@@ -84,6 +84,15 @@ def test_a_weekday_that_differs_is_learned_but_shrunk_toward_all_days():
     assert thu < wed < 180.0 and wed > 140.0, (wed, thu)
 
 
+def test_a_corrupt_bucket_is_skipped_not_averaged_in():
+    # 2026-11-05: one 429-GW Marstek poll left 7.2 GWh in a single bucket, and the
+    # profile then forecast ~65 MWh per quarter hour around 18:00 on every day.
+    rows = _rows(_flat_days("2026-09-01", 28))
+    rows[20 * 96 + 73]["house_wh"] = 7_158_930_763.63
+    prof = lp.fit_load_profile(rows, _ts("2026-09-29"))
+    assert max(prof.wh) == pytest.approx(100.0)
+
+
 def test_recent_weeks_count_more():
     # load rose from 100 to 200 Wh two weeks ago: the profile leans to the new level
     days = {**_flat_days("2026-08-01", 28, wh=100.0), **_flat_days("2026-08-29", 14, wh=200.0)}

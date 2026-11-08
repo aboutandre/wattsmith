@@ -50,6 +50,7 @@ _const.BASE_SENSOR_POWER = "grid_power"
 _const.BASE_SENSOR_CAPACITY = "battery_capacity"
 _const.BASE_SVC_SET_PASSIVE_MODE = "set_passive_mode"
 _const.BASE_SVC_SET_MODE = "set_mode"
+_const.MAX_PLAUSIBLE_POWER_W = 50_000.0
 sys.modules["wattsmith.const"] = _const
 
 # ── load battery_bridge ───────────────────────────────────────────────────────
@@ -229,6 +230,17 @@ def test_read_all_happy_path():
     assert s.soc == 75.0
     assert s.power == -500
     assert s.capacity == 5120.0
+    assert s.available is True
+
+
+def test_read_all_drops_an_implausible_power_reading():
+    # 2026-11-05: the base once reported 429,496,729,797 W for one poll.
+    hass = _make_hass(
+        _battery_ents("entry_a", "device_a"),
+        {"sensor.entry_a_soc": "26.0", "sensor.entry_a_power": "429496729797"},
+    )
+    s = BatteryBridge(hass).read_all()[0]
+    assert s.power == 0
     assert s.available is True
 
 
