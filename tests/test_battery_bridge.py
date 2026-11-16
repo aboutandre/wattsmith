@@ -190,6 +190,14 @@ def test_discover_finds_two_batteries():
     assert {h.battery_id for h in handles} == {"entry_a", "entry_b"}
 
 
+def test_discover_skips_a_disabled_battery():
+    # a battery whose device or config entry is disabled in HA is parked
+    ents = _battery_ents("entry_a", "device_a") + _battery_ents("entry_b", "device_b")
+    ents[3].disabled_by = "device"           # entry_b's SOC marker sensor
+    handles = discover_batteries(_make_hass(ents))
+    assert {h.battery_id for h in handles} == {"entry_a"}
+
+
 def test_discover_skips_entry_without_soc_marker():
     # e.g. a leftover manager entry that exposes only non-battery sensors
     non_bat = _Ent(BASE, "mgr_entry", f"{BASE}_mgr_entry_something_else",

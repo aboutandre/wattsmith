@@ -37,6 +37,7 @@ from .arbitrage import (
     with_discharge_overhead,
 )
 from .battery_bridge import BatteryBridge
+from .fleet import ActiveTracker
 from .load_profile import LoadProfile, day_forecast, fit_load_profile
 from .const import (
     CONF_ADAPTIVE_CEILING_SOC,
@@ -126,6 +127,9 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         )
         self.entry = entry
         self.bridge = BatteryBridge(hass)
+        # calibration only tracks batteries that are part of the fleet: a stored
+        # battery can never reach 100 % and would keep calibration "due" forever
+        self._active = ActiveTracker()
         self._measured_eta: float | None = None
         # last history refresh (None until the first one lands — the DB starts after us)
         self._eta_measured_at: float | None = None
@@ -377,8 +381,11 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
                     "calibration_batteries": {}}
         rows = await query(int(now - DRIFT_STATE_DAYS * 86400), int(now),
                            table="battery_bucket", limit=DRIFT_STATE_DAYS * 96 * 16)
+        active = self._active.update(states, time.monotonic())
+        rows = [r for r in rows if r.get("battery_id") in active]
         drift = battery_drift_now(rows, self._drift_fits, self._fleet_drift,
-                                  {s.battery_id: s.soc for s in states}, now)
+                                  {s.battery_id: s.soc for s in states
+                                   if s.battery_id in active}, now)
         per_bucket = bat.charge_power_w * 0.25
         cap_w = float(opts.get(CONF_IMPORT_POWER_CAP_W, 0) or 0)
         if cap_w > 0:
@@ -444,7 +451,8 @@ class ArbitrageCoordinator(DataUpdateCoordinator):
         min_soc = float(self.entry.options.get(CONF_MIN_SOC, DEFAULT_MIN_SOC))
         max_soc = (100.0 if self.calibration_open_ceiling
                    else float(self.entry.options.get(CONF_MAX_BATTERY_SOC, DEFAULT_MAX_BATTERY_SOC)))
-        charge_power = DEFAULT_MAX_BATTERY_POWER * len(states)
+        # only the batteries that are answering can take a charge
+        charge_power = DEFAULT_MAX_BATTERY_POWER * len(socs)
         return BatteryModel(soc_pct=soc, capacity_wh=cap, min_soc=min_soc,
                             max_soc=max_soc, charge_power_w=charge_power)
 
