@@ -94,6 +94,10 @@ def discover_batteries(hass: HomeAssistant) -> list[BatteryHandle]:
         if soc_uid not in uid_map:
             continue  # not a battery (e.g. the base's manager/EV entry)
         soc_entity = uid_map[soc_uid]
+        if _is_disabled(ent_reg, soc_entity):
+            # the device or its config entry is disabled in HA: the battery is
+            # parked (e.g. stored at 50 %), not part of the fleet
+            continue
         device_id = _device_id_for(ent_reg, soc_entity)
         if device_id is None:
             _LOGGER.debug("Battery entry %s SOC sensor has no device; skipping", entry_id)
@@ -108,6 +112,11 @@ def discover_batteries(hass: HomeAssistant) -> list[BatteryHandle]:
             )
         )
     return handles
+
+
+def _is_disabled(ent_reg, entity_id: str) -> bool:
+    ent = ent_reg.async_get(entity_id)
+    return bool(getattr(ent, "disabled_by", None)) if ent else False
 
 
 def _device_id_for(ent_reg, entity_id: str) -> str | None:

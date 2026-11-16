@@ -89,6 +89,7 @@ _load("safety")
 _load("planner")
 _load("adaptive")
 _load("baseline_learner")
+_load("fleet")
 _mgr = _load("manager")
 
 EnergyManagerCoordinator = _mgr.EnergyManagerCoordinator
@@ -370,6 +371,33 @@ def test_a_battery_dropout_does_not_shrink_the_fleet():
     assert before.status != "inactive", before.reason
     assert after.fleet_headroom_wh == before.fleet_headroom_wh
     assert after.headroom_wh == before.headroom_wh
+
+
+def test_a_stored_battery_leaves_the_fleet_after_the_grace_period():
+    # 2026-11-16: two of three batteries unplugged and stored; the headroom kept
+    # counting 3 x 5120 Wh for days because the capacity cache never forgot them
+    mgr = make_manager(states={"sun.sun": _sun(3.0, 14.0),
+                               "sensor.solcast": SimpleNamespace(state="4.0")})
+    mgr.adaptive_enabled, mgr.solcast_sensor = True, "sensor.solcast"
+    mgr.max_battery_soc = 80.0
+    clock = [1000.0]
+    real = _mgr.time.monotonic
+    _mgr.time.monotonic = lambda: clock[0]
+    try:
+        full = [_bat("f9", 50.0), _bat("f10", 50.0, device="d2"), _bat("f11", 50.0, device="d3")]
+        stored = [_bat("f9", 50.0),
+                  _bat("f10", None, available=False, capacity=None, device="d2"),
+                  _bat("f11", None, available=False, capacity=None, device="d3")]
+        three = mgr._eval_adaptive(full)
+        clock[0] += 60                                   # a minute later: still counted
+        assert mgr._eval_adaptive(stored).fleet_headroom_wh == three.fleet_headroom_wh
+        assert mgr._import_cap_w() == 3 * 2500
+        clock[0] += 900                                  # past the grace period
+        one = mgr._eval_adaptive(stored)
+        assert one.fleet_headroom_wh == 5120.0 * (100.0 - 50.0) / 100.0
+        assert mgr._import_cap_w() == 2500
+    finally:
+        _mgr.time.monotonic = real
 
 
 # ── Max Charge SOC as a soft cap (hel-140) ────────────────────────────────────

@@ -33,6 +33,7 @@ from .adaptive import (
 )
 from .baseline_learner import BaselineLearner
 from .battery_bridge import BatteryBridge
+from .fleet import ActiveTracker
 from .const import (
     CONF_ADAPTIVE_BASELINE_W,
     CONF_ADAPTIVE_CEILING_SOC,
@@ -131,6 +132,10 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         # Latest adaptive decision (published for the Adaptive entities).
         self._adaptive: AdaptiveResult | None = None
         self._battery_capacity_wh: dict[str, float] = {}
+        # Batteries that count toward the fleet (capacity, import cap): drops a
+        # battery that has been unavailable for a while, e.g. one put in storage.
+        self._active = ActiveTracker()
+        self._active_ids: set[str] | None = None
         self._ceiling_lift: float | None = None
         # True while a calibration full charge is lifting the ceiling (published on status).
         self._calibrating = False
@@ -299,7 +304,8 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         cap = int(float(raw)) if raw not in (None, "") else 0
         if cap > 0:
             return cap
-        n = len(self.bridge.device_ids()) or 1
+        n = (len(self._active_ids) if self._active_ids is not None
+             else len(self.bridge.device_ids())) or 1
         return n * DEFAULT_MAX_BATTERY_POWER
 
     @staticmethod
@@ -375,10 +381,16 @@ class EnergyManagerCoordinator(DataUpdateCoordinator):
         """Compute the effective Max Charge SOC for this tick from the fleet + forecast."""
         # A battery that misses one poll reports no capacity; remember each battery's
         # last capacity so a dropout doesn't shrink the fleet (and its headroom) by a
-        # third for a minute (F9, 2026-09-24 19:20).
+        # third for a minute (F9, 2026-09-24 19:20). But a battery that stays away
+        # (unplugged and stored) must leave the fleet, or the headroom keeps counting
+        # its capacity forever (2026-11-16: 3 x 5120 Wh with one battery left).
+        self._active_ids = active = self._active.update(states, time.monotonic())
         for s in states:
             if s.capacity:
                 self._battery_capacity_wh[s.battery_id] = s.capacity
+        for bid in list(self._battery_capacity_wh):
+            if bid not in active:
+                del self._battery_capacity_wh[bid]
         fleet_cap = sum(self._battery_capacity_wh.values())
         weighted = [(s.soc, s.capacity) for s in states if s.soc is not None and s.capacity]
         fleet_soc = (
