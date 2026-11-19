@@ -42,6 +42,7 @@ class WallboxState:
     connected: bool | None = None  # car plugged in; None = unknown
     done: bool | None = None       # car reports charge complete; None = unknown
     max_amp: int | None = None     # hardware/cable limit reported by the box (A)
+    energy_total_wh: float | None = None  # the box's own lifetime energy meter (Wh)
 
 
 class WallboxDriver(Protocol):

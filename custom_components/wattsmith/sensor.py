@@ -66,7 +66,17 @@ EV_SENSORS: tuple[tuple[str, str, str | None, str | None, str], ...] = (
     # entities (recorder history included), so that integration can be removed
     ("ev_power_w", "EV Power", "W", "power", "mdi:flash"),
     ("car", "EV Car", None, None, "mdi:car-electric"),
+    # the charger's own lifetime meter: add it to the Energy dashboard as an
+    # individual device (wattsmith.backfill_ev_energy fills in older history)
+    ("ev_energy_total_kwh", "EV Energy", "kWh", "energy", "mdi:car-electric-outline"),
 )
+
+# Long-term statistics for EV sensors. Without a state class HA purges the
+# history after the recorder window (~10 days) and keeps nothing.
+EV_STATE_CLASSES: dict[str, SensorStateClass] = {
+    "ev_power_w": SensorStateClass.MEASUREMENT,
+    "ev_energy_total_kwh": SensorStateClass.TOTAL_INCREASING,
+}
 
 # Arbitrage advisory + economics (read from the arbitrage coordinator).
 ARBITRAGE_SENSORS: tuple[tuple[str, str, str | None, str | None, str], ...] = (
@@ -270,6 +280,8 @@ class EvSensor(CoordinatorEntity, SensorEntity):
         self._attr_device_class = device_class
         self._attr_icon = icon
         self._attr_unique_id = f"{entry_id}_ev_{key}"
+        if key in EV_STATE_CLASSES:
+            self._attr_state_class = EV_STATE_CLASSES[key]
         self._attr_device_info = {
             "identifiers": {(DOMAIN, entry_id + "_ev")},
             "name": f"{title} EV",

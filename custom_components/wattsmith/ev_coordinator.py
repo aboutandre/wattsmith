@@ -360,6 +360,11 @@ class EvCoordinator(DataUpdateCoordinator):
                 "price": obs.price,
                 "ev_mode": self._ev_mode,
                 "ev_power_w": car_power_w,
+                # charger's lifetime meter (kWh); None while it can't be read
+                "ev_energy_total_kwh": (
+                    round(wb.energy_total_wh / 1000.0, 3)
+                    if wb is not None and wb.energy_total_wh is not None else None
+                ),
                 "max_amp": max_amp,
                 "wallbox_reachable": wb is not None,
                 "goe_configured": self._driver is not None,  # legacy key, kept for entities
@@ -373,7 +378,8 @@ class EvCoordinator(DataUpdateCoordinator):
                 "bridge_active": False,
                 "car_connected": False, "car_done": False, "car": "unknown",
                 "battery_soc": None, "battery_charge_w": 0.0, "grid_w": None, "price": None,
-                "ev_mode": self._ev_mode, "ev_power_w": None, "max_amp": None,
+                "ev_mode": self._ev_mode, "ev_power_w": None, "ev_energy_total_kwh": None,
+                "max_amp": None,
                 "wallbox_reachable": False,
                 "goe_configured": self._driver is not None,
             }
