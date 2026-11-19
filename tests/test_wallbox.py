@@ -165,14 +165,24 @@ def test_read_normalizes_full_status():
     session = _FakeSession(payload={
         "frc": 1, "psm": 1, "amp": 6, "car": 4,
         "nrg": [0] * 11 + [1208.0], "cll": {"currentLimitMax": 16},
-        "acs": 0, "trx": None,
+        "acs": 0, "trx": None, "eto": 951234,
     })
     st = _run(GoeWallbox("192.0.2.1", session).read())
     assert st.force == FORCE_OFF and st.amp == 6 and st.phases == 1
     assert st.power_w == 1208.0 and st.connected is True and st.done is False
     assert st.max_amp == 16
+    assert st.energy_total_wh == 951234.0
     url, params = session.calls[0]
     assert url.endswith("/api/status") and "frc" in params["filter"]
+    assert "eto" in params["filter"].split(",")
+
+
+def test_parse_energy_from_eto():
+    assert _goe._energy_from_eto(295697) == 295697.0
+    assert _goe._energy_from_eto("12.5") == 12.5
+    assert _goe._energy_from_eto(None) is None
+    assert _goe._energy_from_eto("n/a") is None
+    assert _goe._energy_from_eto(-1) is None   # never a fake reset
 
 
 def test_read_unreachable_returns_none():

@@ -164,7 +164,8 @@ working.
 | `select.wattsmith_ev_ev_charging_mode` | select | `off` / `solar` / `solar_cheap` / `fast` |
 | `sensor.wattsmith_ev_ev_state` | sensor | Coordinator state |
 | `sensor.wattsmith_ev_ev_reason` | sensor | Human-readable reason for current state |
-| `sensor.wattsmith_ev_ev_power` | sensor | Actual charger power (W), read from the wallbox driver |
+| `sensor.wattsmith_ev_ev_power` | sensor | Actual charger power (W), read from the wallbox driver. Long-term statistics |
+| `sensor.wattsmith_ev_ev_energy` | sensor | The charger's own lifetime energy meter (kWh, `total_increasing`). Add it to the Energy dashboard as an individual device; `wattsmith.backfill_ev_energy` fills in the history from before it existed |
 | `sensor.wattsmith_ev_ev_car` | sensor | Car connection state: `disconnected` / `connected` / `charging` / `complete` |
 | `sensor.wattsmith_ev_ev_target_power` | sensor | Requested charge power (W) |
 | `sensor.wattsmith_ev_ev_charge_current` | sensor | Current commanded (A) |

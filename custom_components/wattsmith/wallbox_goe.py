@@ -13,6 +13,7 @@ go-e key semantics used:
   cll  current limits; currentLimitMax = effective hardware/cable/adapter cap
   acs  access control: 0=Open, 1=Wait(needs authorization), 2=EVCMS
   trx  transaction: null=none, 0=authorized without card
+  eto  lifetime energy counter of the charger's own meter (Wh)
   modelStatus  the charger's own "why (not) charging" reason enum
 
 Reliability notes (firmware-confirmed, go-e API issue #117):
@@ -36,7 +37,7 @@ from .wallbox import FORCE_NEUTRAL, FORCE_OFF, FORCE_ON, WallboxState
 
 _LOGGER = logging.getLogger(__name__)
 
-_STATUS_FILTER = "frc,psm,amp,car,nrg,cll,acs,trx"
+_STATUS_FILTER = "frc,psm,amp,car,nrg,cll,acs,trx,eto"
 
 _FORCE_BY_FRC = {0: FORCE_NEUTRAL, 1: FORCE_OFF, 2: FORCE_ON}
 _FRC_BY_FORCE = {v: k for k, v in _FORCE_BY_FRC.items()}
@@ -84,6 +85,7 @@ class GoeWallbox:
             connected=connected,
             done=done,
             max_amp=_max_amp_from_cll(data.get("cll")),
+            energy_total_wh=_energy_from_eto(data.get("eto")),
         )
 
     async def apply(self, charge: bool, amp: int, phases: int) -> bool:
@@ -151,6 +153,17 @@ def _power_from_nrg(nrg: Any) -> float | None:
         return float(nrg[11])
     except (TypeError, ValueError, IndexError):
         return None
+
+
+def _energy_from_eto(eto: Any) -> float | None:
+    """eto = lifetime energy in Wh. Missing, non-numeric or negative → None
+    (a None makes the energy sensor unavailable for that tick; a made-up 0
+    would read as a meter reset and corrupt the long-term statistics)."""
+    try:
+        value = float(eto)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
 
 
 def _max_amp_from_cll(cll: Any) -> int | None:

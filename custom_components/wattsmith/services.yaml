@@ -46,3 +46,29 @@ query_history:
           max: 5000
           step: 1
           mode: box
+
+backfill_ev_energy:
+  name: Backfill EV energy history
+  description: >-
+    Writes EV charging energy from before the EV Energy sensor existed into its
+    long-term statistics, so the Energy dashboard shows the full history. Uses an
+    older statistic of the same charger meter when given (exact totals) and
+    Wattsmith's 15-minute history DB for the hour-by-hour shape. Dry run by
+    default: it only reports what it would write. Safe to run more than once.
+  fields:
+    meter_statistic_id:
+      name: Old meter statistic
+      description: >-
+        Optional. A long-term statistic of the same lifetime counter from a
+        removed charger integration, e.g. sensor.goe_318468_eto.
+      required: false
+      example: sensor.goe_318468_eto
+      selector:
+        text:
+    dry_run:
+      name: Dry run
+      description: Only report the plan, write nothing.
+      required: false
+      default: true
+      selector:
+        boolean:

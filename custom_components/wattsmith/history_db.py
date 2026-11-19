@@ -919,6 +919,25 @@ class HistoryRecorder:
         finally:
             conn.close()
 
+    def ev_hourly_wh(self, start_ts: int, end_ts: int) -> list[tuple[int, float]]:
+        """EV energy per UTC hour, [(hour_start_ts, Wh)], for buckets starting in
+        [start_ts, end_ts). Hours without logged buckets are simply absent.
+        Blocking (sqlite) — call via `async_ev_hourly_wh`."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT ts_start - (ts_start % 3600) AS h, SUM(COALESCE(ev_wh, 0)) "
+                "FROM bucket WHERE ts_start >= ? AND ts_start < ? GROUP BY h ORDER BY h",
+                (int(start_ts), int(end_ts)),
+            ).fetchall()
+            return [(int(h), float(wh)) for h, wh in rows]
+        finally:
+            conn.close()
+
+    async def async_ev_hourly_wh(self, start_ts: int, end_ts: int) -> list[tuple[int, float]]:
+        """Event-loop-safe wrapper around `ev_hourly_wh`."""
+        return await self.hass.async_add_executor_job(self.ev_hourly_wh, start_ts, end_ts)
+
     async def async_query_range(
         self,
         start_ts: int,
